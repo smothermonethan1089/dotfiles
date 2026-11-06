@@ -1,4 +1,17 @@
 #!/usr/bin/env bash
+# --- If this was piped in ("curl ... | bash", "bash < install.sh") there is no
+# --- file on disk to copy onto the rice CD or hand to your user, so save the
+# --- rest of the script to a real file first and run that instead.
+if [ -z "${BASH_SOURCE[0]:-}" ] || [ ! -f "${BASH_SOURCE[0]}" ]; then
+    _self="$(mktemp /tmp/shastenm-install-XXXXXX)"
+    case "${BASH_SOURCE[0]:-}" in
+        /dev/fd/*|/proc/*) { echo '#!/usr/bin/env bash'; cat "${BASH_SOURCE[0]}"; } > "$_self" ;;  # bash <(curl ...)
+        *)                 { echo '#!/usr/bin/env bash'; cat; } > "$_self" ;;                     # curl ... | bash
+    esac
+    chmod 755 "$_self"
+    if [ -r /dev/tty ] && { : </dev/tty; } 2>/dev/null; then exec bash "$_self" "$@" </dev/tty
+    else exec bash "$_self" "$@" </dev/null; fi
+fi
 # =============================================================================
 # shastenm Linux Dev Labs — Dotfiles Installer  (v2)
 # Supports: Void Linux | Slackware (incl. Salix) | FreeBSD (incl. GhostBSD)
@@ -16,6 +29,12 @@
 #   • Safe to start as root (or with sudo): packages are installed as root,
 #     the dotfiles go to your normal user. Sourcing it can no longer log you out.
 #   • --isos downloads the latest Void / Slackware / FreeBSD ISOs first.
+#   • PROXMOX: run it on the Proxmox host (web shell or SSH, as root) and it
+#     downloads the 3 ISOs into ISO storage, builds a "shastenm-rice" CD with
+#     this script + both repos, and creates + starts a VM for each OS with
+#     both discs attached. Inside each VM, after installing the OS:
+#       Void / Slackware: mount /dev/disk/by-label/SHASTENM /mnt && sh /mnt/run.sh
+#       FreeBSD:          mount -t cd9660 /dev/iso9660/SHASTENM /mnt && sh /mnt/run.sh
 #
 # Usage:
 #   ./install.sh [options] [dotfiles-bsd-main] [spectrwm-bsd-main]
@@ -33,6 +52,12 @@
 #                     and FreeBSD ISOs, then carry on with the install
 #   --isos-only [dir] download the ISOs and stop
 #                     (dir default: Proxmox ISO store if present, else ~/Downloads/isos)
+#   Proxmox only:
+#   --storage <id>    disk storage for the VMs (default: local-lvm/local-zfs/first)
+#   --iso-storage <id> ISO storage (default: local)
+#   --bridge <vmbr>   network bridge (default: first vmbr, usually vmbr0)
+#   --no-vms          only download ISOs + build the rice CD
+#   --no-start        create the VMs but don't start them
 #   -y, --yes         don't ask questions
 #   -h, --help        show this help
 # =============================================================================
@@ -74,6 +99,7 @@ DO_PACKAGES=1; DO_FONTS=1; OFFLINE=0; ASSUME_YES=0; WITH_SPECTRWM_SLACK=0
 NVIM_DISTRO="astro"
 POSITIONAL=()
 TARGET_USER=""; USER_PHASE=0; ISO_MODE=0; ISO_DIR=""
+PVE_STORAGE=""; PVE_ISO_STORAGE=""; PVE_BRIDGE=""; PVE_VMS=1; PVE_START=1
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -85,12 +111,17 @@ while [ $# -gt 0 ]; do
         -y|--yes)        ASSUME_YES=1 ;;
         --user)          shift; TARGET_USER="${1:?--user needs a user name}" ;;
         --user-phase)    USER_PHASE=1 ;;                       # internal
+        --storage)       shift; PVE_STORAGE="${1:?--storage needs a storage id}" ;;
+        --iso-storage)   shift; PVE_ISO_STORAGE="${1:?--iso-storage needs a storage id}" ;;
+        --bridge)        shift; PVE_BRIDGE="${1:?--bridge needs a bridge name}" ;;
+        --no-vms)        PVE_VMS=0 ;;
+        --no-start)      PVE_START=0 ;;
         --isos|--isos-only)
             [ "$1" = "--isos" ] && ISO_MODE=1 || ISO_MODE=2
             if [ $# -gt 1 ] && [[ "$2" != -* ]] && [[ "$2" != *.zip ]] && ! [ -e "$2/spectrwm.conf" ] && ! [ -e "$2/.bashrc" ]; then
                 shift; ISO_DIR="$1"
             fi ;;
-        -h|--help)       sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)       awk '/^# =====/{n++; next} n==1' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
         -*)              err "Unknown option: $1 (see --help)" ;;
         *)               POSITIONAL+=("$1") ;;
     esac
@@ -100,15 +131,17 @@ ARG_DOTFILES="${POSITIONAL[0]:-}"
 ARG_SPECTRWM="${POSITIONAL[1]:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
 TS="$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="$HOME/.shastenm-backup-$TS"
 WORK_DIR="$HOME/.local/share/shastenm-build"
 SPECTRWM_DEST="$HOME/.config/spectrwm"
 
 # Upstream repos (overridable via environment)
-REPO_DOTFILES_BSD="${REPO_DOTFILES_BSD:-https://gitlab.com/shastenm/dotfiles-bsd.git}"
-REPO_SPECTRWM_BSD="${REPO_SPECTRWM_BSD:-https://gitlab.com/shastenm/spectrwm-bsd.git}"
-REPO_DMENU="${REPO_DMENU:-https://gitlab.com/shastenm/dmenu-solarized.git}"
+# (space-separated: tried in order)
+REPO_DOTFILES_BSD="${REPO_DOTFILES_BSD:-https://gitlab.com/smothermonethan2002/dotfiles-bsd.git https://gitlab.com/shastenm/dotfiles-bsd.git}"
+REPO_SPECTRWM_BSD="${REPO_SPECTRWM_BSD:-https://gitlab.com/smothermonethan2002/spectrwm-bsd.git https://gitlab.com/shastenm/spectrwm-bsd.git}"
+REPO_DMENU="${REPO_DMENU:-https://gitlab.com/shastenm/dmenu-solarized.git https://gitlab.com/smothermonethan2002/dmenu-solarized.git}"
 REPO_BIN="${REPO_BIN:-https://gitlab.com/cuauhtlios/bin.git}"
 REPO_WALLPAPERS=("https://gitlab.com/shastenm/wallpaper.git" "https://gitlab.com/smothermonethan2002/wallpaper.git")
 REPO_DZEN="https://github.com/robm/dzen.git"
@@ -259,7 +292,7 @@ find_root() {
     extract_zip() {
         local zip="$1" dest="$WORK_DIR/src/$name"
         have unzip || err "unzip is needed to read $zip"
-        rm -rf "$dest"; mkdir -p "$dest"
+        rm -rf "${dest:?}"; mkdir -p "$dest"
         unzip -qo "$zip" -d "$dest"
         local hit; hit="$(find "$dest" -maxdepth 3 -path "*/$marker" -print -quit)"
         [ -n "$hit" ] || return 1
@@ -284,9 +317,14 @@ find_root() {
     done
 
     if [ "$OFFLINE" -eq 0 ] && have git; then
-        local dest="$WORK_DIR/src/$name"
-        rm -rf "$dest"
-        git clone --depth=1 "$url" "$dest" >&2 && [ -e "$dest/$marker" ] && { echo "$dest"; return; }
+        local dest="$WORK_DIR/src/$name" u
+        for u in $url; do
+            rm -rf "${dest:?}"
+            echo -e "${BLUE}[INFO]${NC}  Cloning $u" >&2
+            if git clone --depth=1 -q "$u" "$dest" >&2 && [ -e "$dest/$marker" ]; then
+                echo "$dest"; return
+            fi
+        done
     fi
     err "Cannot find $name.\nUsage: $0 <path-to-dotfiles-bsd-main> <path-to-spectrwm-bsd-main>"
 }
@@ -331,7 +369,7 @@ skip_spectrwm() {
 # compare against the patched result and don't re-backup every time
 stage_tree() {
     local dest="$WORK_DIR/stage/$2"
-    rm -rf "$dest"; mkdir -p "$(dirname "$dest")"
+    rm -rf "${dest:?}"; mkdir -p "$(dirname "$dest")"
     cp -RPp "$1" "$dest"
     echo "$dest"
 }
@@ -484,9 +522,14 @@ deploy_spectrwm() {
 # EXTRA REPOS: dmenu-solarized, sm-* scripts, dzen2/spectrwm source fallback
 # =============================================================================
 clone_or_pull() {
-    local url="$1" dest="$2"
-    if [ -d "$dest/.git" ]; then git -C "$dest" pull --ff-only -q || true
-    else rm -rf "$dest"; git clone --depth=1 -q "$url" "$dest"; fi
+    # clone_or_pull "<url> [fallback-url...]" <dest>
+    local urls="$1" dest="$2" u
+    if [ -d "$dest/.git" ]; then git -C "$dest" pull --ff-only -q || true; return 0; fi
+    for u in $urls; do
+        rm -rf "${dest:?}"
+        git clone --depth=1 -q "$u" "$dest" 2>/dev/null && return 0
+    done
+    return 1
 }
 
 MAKE="make"
@@ -790,6 +833,7 @@ fetch_iso() {
     else warn "$label: CHECKSUM MISMATCH — deleting $file"; rm -f "$out"; return 1; fi
 }
 
+ISO_VOID=""; ISO_SLACK=""; ISO_FBSD=""
 download_isos() {
     section "Downloading OS ISOs"
     have curl || err "curl is needed to download ISOs"
@@ -807,7 +851,7 @@ download_isos() {
     # Void — x86_64 glibc base live image (the glibc build he moved to from musl)
     f="$(fetch_listing "$VOID_LIVE" | grep -oE 'void-live-x86_64-[0-9]{8}-base\.iso' | sort -u | tail -n1)"
     sum="$(curl -fsSL "$VOID_LIVE/sha256sum.txt" | grep -F "($f)" | awk '{print $NF}')"
-    if [ -n "$f" ] && [ -n "$sum" ]; then fetch_iso "Void" "$VOID_LIVE/$f" "$f" 256 "$sum" || failed=1
+    if [ -n "$f" ] && [ -n "$sum" ]; then if fetch_iso "Void" "$VOID_LIVE/$f" "$f" 256 "$sum"; then ISO_VOID="$f"; else failed=1; fi
     else warn "Void: couldn't read $VOID_LIVE"; failed=1; fi
 
     # Slackware — newest slackware64-X.Y install DVD
@@ -816,7 +860,7 @@ download_isos() {
     if [ -n "$ver" ]; then
         f="slackware64-$ver-install-dvd.iso"
         sum="$(curl -fsSL "$SLACK_ISO/slackware64-$ver-iso/$f.md5" | awk '{print $1}')"
-        if [ -n "$sum" ]; then fetch_iso "Slackware $ver" "$SLACK_ISO/slackware64-$ver-iso/$f" "$f" md5 "$sum" || failed=1
+        if [ -n "$sum" ]; then if fetch_iso "Slackware $ver" "$SLACK_ISO/slackware64-$ver-iso/$f" "$f" md5 "$sum"; then ISO_SLACK="$f"; else failed=1; fi
         else warn "Slackware: no checksum file"; failed=1; fi
     else warn "Slackware: couldn't read $SLACK_ISO"; failed=1; fi
 
@@ -825,7 +869,7 @@ download_isos() {
     if [ -n "$ver" ]; then
         f="FreeBSD-$ver-RELEASE-amd64-disc1.iso"
         sum="$(curl -fsSL "$FBSD_ISO/$ver/CHECKSUM.SHA256-FreeBSD-$ver-RELEASE-amd64" | grep -F "($f)" | awk '{print $NF}')"
-        if [ -n "$sum" ]; then fetch_iso "FreeBSD $ver" "$FBSD_ISO/$ver/$f" "$f" 256 "$sum" || failed=1
+        if [ -n "$sum" ]; then if fetch_iso "FreeBSD $ver" "$FBSD_ISO/$ver/$f" "$f" 256 "$sum"; then ISO_FBSD="$f"; else failed=1; fi
         else warn "FreeBSD: no checksum for $f"; failed=1; fi
     else warn "FreeBSD: couldn't read $FBSD_ISO"; failed=1; fi
 
@@ -837,6 +881,183 @@ download_isos() {
 
     [ "$failed" -eq 0 ] && ok "All 3 ISOs ready in $ISO_DIR" || warn "Some ISOs failed — re-run with --isos-only to resume"
     ls -lh "$ISO_DIR"/*.iso 2>/dev/null | awk '{print "    " $5 "  " $NF}' || true
+}
+
+
+# =============================================================================
+# PROXMOX MODE
+# =============================================================================
+is_proxmox() { [ -d /etc/pve ] && have qm && have pvesm; }
+
+pve_pick_storage() {
+    # pve_pick_storage <content> <preferred...>
+    local content="$1"; shift
+    local list p
+    list="$(pvesm status --content "$content" --enabled 1 2>/dev/null | awk 'NR>1 && $3=="active"{print $1}')"
+    for p in "$@"; do
+        if grep -qx "$p" <<<"$list"; then echo "$p"; return; fi
+    done
+    head -n1 <<<"$list"
+}
+
+pve_tools() {
+    local need=()
+    have unzip || need+=(unzip)
+    have git   || need+=(git)
+    have genisoimage || have xorriso || need+=(genisoimage)
+    [ ${#need[@]} -eq 0 ] && return 0
+    section "Installing host tools: ${need[*]}"
+    apt-get update -qq 2>/dev/null || warn "apt-get update had errors (enterprise repo without a subscription?) — trying anyway"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${need[@]}" \
+        || err "Couldn't install ${need[*]}.\n      Enable the pve-no-subscription repo (node → Updates → Repositories) and re-run."
+}
+
+build_rice_iso() {
+    section "Building the shastenm-rice CD"
+    local stage="$WORK_DIR/rice-cd" out="$ISO_DIR/shastenm-rice.iso"
+    rm -rf "${stage:?}"; mkdir -p "$stage"
+    cp "$SELF" "$stage/install.sh"
+    cp -RPp "$DOTFILES_ROOT" "$stage/dotfiles-bsd-main"
+    cp -RPp "$SPECTRWM_ROOT" "$stage/spectrwm-bsd-main"
+    rm -rf "${stage:?}/dotfiles-bsd-main/.git" "${stage:?}/spectrwm-bsd-main/.git"
+    cat > "$stage/run.sh" <<'EOF'
+#!/bin/sh
+# shastenm rice — run as root inside the new VM after the OS is installed:
+#   Void / Slackware : mount /dev/disk/by-label/SHASTENM /mnt && sh /mnt/run.sh
+#   FreeBSD          : mount -t cd9660 /dev/iso9660/SHASTENM /mnt && sh /mnt/run.sh
+# Extra options go straight to install.sh, e.g.  sh /mnt/run.sh --user ethan
+set -e
+SRC="$(cd "$(dirname "$0")" && pwd)"
+W=/tmp/shastenm-rice
+rm -rf "${W:?}"; mkdir -p "$W"
+cp -R "$SRC/install.sh" "$SRC/dotfiles-bsd-main" "$SRC/spectrwm-bsd-main" "$W/"
+chmod -R u+w "$W"
+if ! command -v bash >/dev/null 2>&1; then
+    if [ "$(uname -s)" = FreeBSD ]; then
+        env ASSUME_ALWAYS_YES=yes pkg bootstrap -f
+        env ASSUME_ALWAYS_YES=yes pkg install -y bash
+    else
+        echo "bash is missing — install it first"; exit 1
+    fi
+fi
+exec bash "$W/install.sh" "$@" "$W/dotfiles-bsd-main" "$W/spectrwm-bsd-main"
+EOF
+    chmod +x "$stage/run.sh" "$stage/install.sh"
+    cat > "$stage/README.TXT" <<'EOF'
+shastenm Linux Dev Labs rice
+Log in as root after installing the OS, then:
+  Void / Slackware : mount /dev/disk/by-label/SHASTENM /mnt && sh /mnt/run.sh
+  FreeBSD          : mount -t cd9660 /dev/iso9660/SHASTENM /mnt && sh /mnt/run.sh
+EOF
+    local mk=(genisoimage); have genisoimage || mk=(xorriso -as mkisofs)
+    # -R (Rock Ridge) keeps real permissions, dotfiles and symlinks
+    "${mk[@]}" -quiet -R -J -joliet-long -V SHASTENM -o "$out" "$stage" 2>/dev/null \
+        || "${mk[@]}" -R -V SHASTENM -o "$out" "$stage"
+    ok "$(basename "$out") → $PVE_ISO_STORAGE:iso/  ($(du -h "$out" | cut -f1))"
+}
+
+pve_create_vm() {
+    # pve_create_vm <name> <ostype> <os-iso> <size-GiB> <mem-MiB>
+    local name="$1" ostype="$2" iso="$3" size="$4" mem="$5" id
+    if [ -z "$iso" ]; then warn "$name: no ISO downloaded — skipping"; return 0; fi
+    id="$(qm list 2>/dev/null | awk -v n="$name" 'NR>1 && $2==n {print $1; exit}')"
+    if [ -n "$id" ]; then
+        ok "$name already exists (VM $id) — refreshing its discs only"
+        qm set "$id" --ide2 "$PVE_ISO_STORAGE:iso/$iso,media=cdrom" \
+                     --ide0 "$PVE_ISO_STORAGE:iso/shastenm-rice.iso,media=cdrom" >/dev/null
+        VM_IDS+=("$id:$name"); return 0
+    fi
+    id="$(pvesh get /cluster/nextid)"
+    qm create "$id" --name "$name" --tags shastenm \
+        --memory "$mem" --cores 2 --cpu host --ostype "$ostype" \
+        --scsihw virtio-scsi-single --scsi0 "$PVE_STORAGE:$size,discard=on,iothread=1" \
+        --net0 "virtio,bridge=$PVE_BRIDGE" --vga std \
+        --ide2 "$PVE_ISO_STORAGE:iso/$iso,media=cdrom" \
+        --ide0 "$PVE_ISO_STORAGE:iso/shastenm-rice.iso,media=cdrom" \
+        --boot 'order=scsi0;ide2' >/dev/null
+    ok "Created VM $id  $name  (${size}G disk on $PVE_STORAGE, ${mem}M RAM, $PVE_BRIDGE)"
+    VM_IDS+=("$id:$name")
+}
+
+proxmox_main() {
+    [ "$(id -u)" -eq 0 ] || err "On Proxmox run this as root (the web shell already is)."
+    DISTRO="proxmox"
+    ok "Detected: Proxmox VE $(pveversion 2>/dev/null | cut -d/ -f2) on $(hostname) — setting up Void, Slackware and FreeBSD VMs"
+    info "(The rice itself goes inside the VMs, not on the hypervisor.)"
+    mkdir -p "$WORK_DIR"
+
+    pve_tools
+
+    # ISO storage → its folder on disk
+    [ -n "$PVE_ISO_STORAGE" ] || PVE_ISO_STORAGE="$(pve_pick_storage iso local)"
+    [ -n "$PVE_ISO_STORAGE" ] || err "No storage with ISO content found (Datacenter → Storage)"
+    ISO_DIR="$(dirname "$(pvesm path "$PVE_ISO_STORAGE:iso/probe.iso")")"
+    TARGET_HOME="$HOME"
+    download_isos
+
+    DOTFILES_ROOT="$(find_root ".config/nvim-configs" "dotfiles-bsd-main" "$ARG_DOTFILES" "$REPO_DOTFILES_BSD")"
+    SPECTRWM_ROOT="$(find_root "spectrwm.conf" "spectrwm-bsd-main" "$ARG_SPECTRWM" "$REPO_SPECTRWM_BSD")"
+    info "Dotfiles root : $DOTFILES_ROOT"
+    info "Spectrwm root : $SPECTRWM_ROOT"
+    build_rice_iso
+
+    VM_IDS=()
+    if [ "$PVE_VMS" -eq 1 ]; then
+        section "Creating VMs"
+        [ -n "$PVE_STORAGE" ] || PVE_STORAGE="$(pve_pick_storage images local-lvm local-zfs local)"
+        [ -n "$PVE_STORAGE" ] || err "No storage with VM-disk content found"
+        [ -n "$PVE_BRIDGE" ]  || PVE_BRIDGE="$(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | grep '^vmbr' | head -n1 || true)"
+        PVE_BRIDGE="${PVE_BRIDGE:-vmbr0}"
+
+        # size disks to what the pool actually has (3 VMs, keep 20% spare)
+        local avail_k size mem host_mem fit
+        avail_k="$(pvesm status --storage "$PVE_STORAGE" 2>/dev/null | awk 'NR==2{print $6}')"
+        size=32
+        if [ -n "$avail_k" ]; then
+            fit=$(( avail_k * 8 / 10 / 1048576 / 3 ))
+            if [ "$fit" -lt "$size" ]; then size="$fit"; fi
+        fi
+        [ "$size" -ge 12 ] || err "$PVE_STORAGE only has room for ${size}G per VM (need 12G+) — free space or use --storage"
+        host_mem="$(awk '/^MemTotal:/{print int($2/1024)}' /proc/meminfo)"
+        mem=4096; if [ "$host_mem" -lt 16384 ]; then mem=2048; fi
+
+        pve_create_vm "void-shastenm"      l26   "$ISO_VOID"  "$size" "$mem"
+        pve_create_vm "slackware-shastenm" l26   "$ISO_SLACK" "$size" "$mem"
+        pve_create_vm "freebsd-shastenm"   other "$ISO_FBSD"  "$size" "$mem"
+
+        if [ "$PVE_START" -eq 1 ]; then
+            local v
+            for v in "${VM_IDS[@]}"; do
+                if ! qm status "${v%%:*}" | grep -q running; then
+                    qm start "${v%%:*}" && ok "Started ${v#*:} (VM ${v%%:*})" || warn "Couldn't start ${v#*:}"
+                fi
+            done
+        fi
+    fi
+
+    echo ""
+    echo -e "${BOLD}${GREEN}╔══════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${GREEN}║      Proxmox ready — shastenm rice VMs           ║${NC}"
+    echo -e "${BOLD}${GREEN}╚══════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo "  ISOs in $PVE_ISO_STORAGE ($ISO_DIR):"
+    echo "    ${ISO_VOID:-<Void failed>}"
+    echo "    ${ISO_SLACK:-<Slackware failed>}"
+    echo "    ${ISO_FBSD:-<FreeBSD failed>}"
+    echo "    shastenm-rice.iso"
+    if [ ${#VM_IDS[@]} -gt 0 ]; then
+        echo ""
+        echo "  VMs (open each one's Console in the web UI):"
+        local v; for v in "${VM_IDS[@]}"; do echo "    ${v%%:*}  ${v#*:}"; done
+    fi
+    echo ""
+    echo -e "${YELLOW}In each VM:${NC}"
+    echo "  1. Install the OS from the first disc (create your user, e.g. ethan)."
+    echo "  2. Reboot, log in as root, then run the rice from the second disc:"
+    echo "       Void / Slackware : mount /dev/disk/by-label/SHASTENM /mnt && sh /mnt/run.sh"
+    echo "       FreeBSD          : mount -t cd9660 /dev/iso9660/SHASTENM /mnt && sh /mnt/run.sh"
+    echo "     (Slackware gets the CLI rice on XFCE; add --with-spectrwm for his desktop.)"
+    echo ""
 }
 
 # =============================================================================
@@ -877,7 +1098,7 @@ hand_off_to_user() {
     section "Switching to $TARGET_USER for the dotfiles"
     # copy the script + sources somewhere the user can read (/root isn't)
     local tmp; tmp="$(mktemp -d /tmp/shastenm-install.XXXXXX)"
-    cp "${BASH_SOURCE[0]}" "$tmp/install.sh"
+    cp "$SELF" "$tmp/install.sh"
     local args=(--user-phase --no-packages)
     [ "$DO_FONTS" -eq 0 ]            && args+=(--no-fonts)
     [ "$OFFLINE" -eq 1 ]             && args+=(--offline)
@@ -892,7 +1113,7 @@ hand_off_to_user() {
     for a in "${args[@]}"; do q+=" $(printf '%q' "$a")"; done
     local rc=0
     su - "$TARGET_USER" -c "bash $tmp/install.sh$q" || rc=$?
-    rm -rf "$tmp"
+    rm -rf "${tmp:?}"
     [ "$rc" -eq 0 ] || err "The $TARGET_USER part stopped with an error (code $rc) — see above. You're still logged in; fix it and re-run."
     exit 0
 }
@@ -913,6 +1134,11 @@ echo -e "${CYAN}  Void | Slackware | FreeBSD${NC}"
 echo ""
 
 TARGET_HOME="$HOME"
+if is_proxmox && [ "$USER_PHASE" -eq 0 ]; then
+    proxmox_main
+    exit 0
+fi
+
 AS_ROOT=0; [ "$(id -u)" -eq 0 ] && AS_ROOT=1
 if [ "$AS_ROOT" -eq 1 ] && [ "$USER_PHASE" -eq 0 ]; then
     pick_target_user
