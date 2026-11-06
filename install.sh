@@ -30,11 +30,11 @@ fi
 #     the dotfiles go to your normal user. Sourcing it can no longer log you out.
 #   • --isos downloads the latest Void / Slackware / FreeBSD ISOs first.
 #   • PROXMOX: run it on the Proxmox host (web shell or SSH, as root) and it
-#     downloads the 3 ISOs into ISO storage, builds a "shastenm-rice" CD with
-#     this script + both repos, and creates + starts a VM for each OS with
-#     both discs attached. Inside each VM, after installing the OS:
-#       Void / Slackware: mount /dev/disk/by-label/SHASTENM /mnt && sh /mnt/run.sh
-#       FreeBSD:          mount -t cd9660 /dev/iso9660/SHASTENM /mnt && sh /mnt/run.sh
+#     builds 3 fully installed VMs with NO keyboard input — login ethan / 1234
+#     (root / 1234) — each with the shastenm rice already on it:
+#       void-shastenm       built from Void's ROOTFS in a chroot, rice baked in
+#       slackware-shastenm  DVD packages installed straight to disk, rice baked in
+#       freebsd-shastenm    FreeBSD's installer run unattended, rice on 1st boot
 #
 # Usage:
 #   ./install.sh [options] [dotfiles-bsd-main] [spectrwm-bsd-main]
@@ -56,6 +56,9 @@ fi
 #   --storage <id>    disk storage for the VMs (default: local-lvm/local-zfs/first)
 #   --iso-storage <id> ISO storage (default: local)
 #   --bridge <vmbr>   network bridge (default: first vmbr, usually vmbr0)
+#   --vm-user <name>  login created in the VMs (default: ethan)
+#   --vm-pass <pass>  password for it and root (default: 1234)
+#   --rebuild         destroy the 3 shastenm VMs first and build them again
 #   --no-vms          only download ISOs + build the rice CD
 #   --no-start        create the VMs but don't start them
 #   -y, --yes         don't ask questions
@@ -100,6 +103,7 @@ NVIM_DISTRO="astro"
 POSITIONAL=()
 TARGET_USER=""; USER_PHASE=0; ISO_MODE=0; ISO_DIR=""
 PVE_STORAGE=""; PVE_ISO_STORAGE=""; PVE_BRIDGE=""; PVE_VMS=1; PVE_START=1
+VM_USER="ethan"; VM_PASS="1234"; PVE_REBUILD=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -116,6 +120,9 @@ while [ $# -gt 0 ]; do
         --bridge)        shift; PVE_BRIDGE="${1:?--bridge needs a bridge name}" ;;
         --no-vms)        PVE_VMS=0 ;;
         --no-start)      PVE_START=0 ;;
+        --vm-user)       shift; VM_USER="${1:?--vm-user needs a name}" ;;
+        --vm-pass)       shift; VM_PASS="${1:?--vm-pass needs a password}" ;;
+        --rebuild)       PVE_REBUILD=1 ;;
         --isos|--isos-only)
             [ "$1" = "--isos" ] && ISO_MODE=1 || ISO_MODE=2
             if [ $# -gt 1 ] && [[ "$2" != -* ]] && [[ "$2" != *.zip ]] && ! [ -e "$2/spectrwm.conf" ] && ! [ -e "$2/.bashrc" ]; then
@@ -833,7 +840,8 @@ fetch_iso() {
     else warn "$label: CHECKSUM MISMATCH — deleting $file"; rm -f "$out"; return 1; fi
 }
 
-ISO_VOID=""; ISO_SLACK=""; ISO_FBSD=""
+ISO_VOID=""; ISO_SLACK=""; ISO_FBSD=""; ISO_FBSD_AUTO=""; VOID_ROOTFS=""
+declare -A VM_STATE=()
 download_isos() {
     section "Downloading OS ISOs"
     have curl || err "curl is needed to download ISOs"
@@ -853,6 +861,17 @@ download_isos() {
     sum="$(curl -fsSL "$VOID_LIVE/sha256sum.txt" | grep -F "($f)" | awk '{print $NF}')"
     if [ -n "$f" ] && [ -n "$sum" ]; then if fetch_iso "Void" "$VOID_LIVE/$f" "$f" 256 "$sum"; then ISO_VOID="$f"; else failed=1; fi
     else warn "Void: couldn't read $VOID_LIVE"; failed=1; fi
+
+    # Void ROOTFS tarball — what the Proxmox auto-install builds the VM from
+    if [ "$DISTRO" = proxmox ] && [ "$PVE_VMS" -eq 1 ]; then
+        f="$(fetch_listing "$VOID_LIVE" | grep -oE 'void-x86_64-ROOTFS-[0-9]{8}\.tar\.xz' | sort -u | tail -n1)"
+        sum="$(curl -fsSL "$VOID_LIVE/sha256sum.txt" | grep -F "($f)" | awk '{print $NF}')"
+        if [ -n "$f" ] && [ -n "$sum" ]; then
+            local keep="$ISO_DIR"; ISO_DIR="$WORK_DIR/dl"; mkdir -p "$ISO_DIR"
+            if fetch_iso "Void ROOTFS" "$VOID_LIVE/$f" "$f" 256 "$sum"; then VOID_ROOTFS="$ISO_DIR/$f"; else failed=1; fi
+            ISO_DIR="$keep"
+        else warn "Void ROOTFS: not found in $VOID_LIVE"; failed=1; fi
+    fi
 
     # Slackware — newest slackware64-X.Y install DVD
     ver="$(fetch_listing "$SLACK_ISO" | grep -oE 'slackware64-[0-9]+\.[0-9]+-iso' | sort -t- -k2 -V -u | tail -n1)"
@@ -904,7 +923,8 @@ pve_tools() {
     local need=()
     have unzip || need+=(unzip)
     have git   || need+=(git)
-    have genisoimage || have xorriso || need+=(genisoimage)
+    have xorriso || need+=(xorriso)
+    have sfdisk  || need+=(fdisk)
     [ ${#need[@]} -eq 0 ] && return 0
     section "Installing host tools: ${need[*]}"
     apt-get update -qq 2>/dev/null || warn "apt-get update had errors (enterprise repo without a subscription?) — trying anyway"
@@ -949,40 +969,351 @@ Log in as root after installing the OS, then:
   Void / Slackware : mount /dev/disk/by-label/SHASTENM /mnt && sh /mnt/run.sh
   FreeBSD          : mount -t cd9660 /dev/iso9660/SHASTENM /mnt && sh /mnt/run.sh
 EOF
-    local mk=(genisoimage); have genisoimage || mk=(xorriso -as mkisofs)
+    local mk=(xorriso -as mkisofs); have xorriso || mk=(genisoimage)
     # -R (Rock Ridge) keeps real permissions, dotfiles and symlinks
     "${mk[@]}" -quiet -R -J -joliet-long -V SHASTENM -o "$out" "$stage" 2>/dev/null \
         || "${mk[@]}" -R -V SHASTENM -o "$out" "$stage"
     ok "$(basename "$out") → $PVE_ISO_STORAGE:iso/  ($(du -h "$out" | cut -f1))"
 }
 
-pve_create_vm() {
-    # pve_create_vm <name> <ostype> <os-iso> <size-GiB> <mem-MiB>
-    local name="$1" ostype="$2" iso="$3" size="$4" mem="$5" id
-    if [ -z "$iso" ]; then warn "$name: no ISO downloaded — skipping"; return 0; fi
+pve_destroy_named() {
+    local name="$1" id
     id="$(qm list 2>/dev/null | awk -v n="$name" 'NR>1 && $2==n {print $1; exit}')"
-    if [ -n "$id" ]; then
-        ok "$name already exists (VM $id) — refreshing its discs only"
-        qm set "$id" --ide2 "$PVE_ISO_STORAGE:iso/$iso,media=cdrom" \
-                     --ide0 "$PVE_ISO_STORAGE:iso/shastenm-rice.iso,media=cdrom" >/dev/null
-        VM_IDS+=("$id:$name"); return 0
+    [ -n "$id" ] || return 0
+    warn "--rebuild: destroying VM $id ($name)"
+    qm stop "$id" >/dev/null 2>&1 || true
+    qm destroy "$id" --purge 1 --destroy-unreferenced-disks 1 >/dev/null
+}
+
+pve_existing_vm() {
+    qm list 2>/dev/null | awk -v n="$1" 'NR>1 && $2==n {print $1; exit}'
+}
+
+# -----------------------------------------------------------------------------
+# Disk-image helpers (run on the Proxmox host)
+# -----------------------------------------------------------------------------
+img_prepare() {
+    # img_prepare <img> <size-GiB> <label>  → sets LOOP MNT ROOT_UUID
+    local img="$1" size="$2" label="$3"
+    rm -f "${img:?}"
+    truncate -s "${size}G" "$img"
+    printf 'label: dos\nlabel-id: 0x5ac0ffee\n,,L,*\n' | sfdisk -q "$img"
+    LOOP="$(losetup -fP --show "$img")"
+    local _ sysdev; for _ in 1 2 3 4 5; do [ -b "${LOOP}p1" ] && break; partx -u "$LOOP" 2>/dev/null || true; sleep 1; done
+    if ! [ -b "${LOOP}p1" ]; then       # no udev: make the node from /sys
+        sysdev="/sys/block/${LOOP##*/}/${LOOP##*/}p1/dev"
+        [ -r "$sysdev" ] && mknod "${LOOP}p1" b "$(cut -d: -f1 "$sysdev")" "$(cut -d: -f2 "$sysdev")"
     fi
+    [ -b "${LOOP}p1" ] || { echo "partition ${LOOP}p1 never appeared"; return 1; }
+    # GRUB 2.06 (Slackware 15) can't read these newer ext4 features
+    mkfs.ext4 -q -F -L "$label" -O ^metadata_csum_seed,^orphan_file "${LOOP}p1" 2>/dev/null \
+        || mkfs.ext4 -q -F -L "$label" "${LOOP}p1"
+    ROOT_UUID="$(blkid -s UUID -o value "${LOOP}p1")"
+    MNT="$WORK_DIR/mnt-$label"
+    mkdir -p "$MNT"
+    mount "${LOOP}p1" "$MNT"
+}
+
+chroot_prepare() {
+    local d
+    for d in dev dev/pts proc sys run; do mkdir -p "$MNT/$d"; done
+    mount --rbind /dev  "$MNT/dev";  mount --make-rslave "$MNT/dev"
+    mount -t proc proc  "$MNT/proc"
+    mount --rbind /sys  "$MNT/sys";  mount --make-rslave "$MNT/sys"
+    mount -t tmpfs tmpfs "$MNT/run"
+    rm -f "$MNT/etc/resolv.conf"
+    cp -L /etc/resolv.conf "$MNT/etc/resolv.conf"
+}
+
+in_chroot() {
+    chroot "$MNT" /usr/bin/env -i HOME=/root TERM=xterm LANG=C.UTF-8 \
+        PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin "$@"
+}
+
+img_cleanup() {
+    [ -n "${MNT:-}" ] || return 0
+    # stop anything the rice left running inside (tmux, gpg-agent, dbus…)
+    local p r
+    for p in /proc/[0-9]*; do
+        r="$(readlink "$p/root" 2>/dev/null || true)"
+        if [ "$r" = "$MNT" ]; then kill -9 "${p#/proc/}" 2>/dev/null || true; fi
+    done
+    sleep 1
+    umount -R "$MNT" 2>/dev/null || umount -lR "$MNT" 2>/dev/null || true
+    [ -n "${SRCMNT:-}" ] && { umount "$SRCMNT" 2>/dev/null || umount -l "$SRCMNT" 2>/dev/null || true; }
+    [ -n "${LOOP:-}" ] && losetup -d "$LOOP" 2>/dev/null || true
+    MNT=""; LOOP=""; SRCMNT=""
+}
+
+write_grub_cfg() {
+    # write_grub_cfg <title> <kernel> <initrd-or-empty> <root-arg> [<title2> <kernel2> <initrd2> <root2>]
+    {
+        echo "set timeout=2"
+        echo "set default=0"
+        while [ $# -ge 4 ]; do
+            echo "menuentry \"$1\" {"
+            echo "    insmod part_msdos"
+            echo "    insmod ext2"
+            echo "    search --no-floppy --fs-uuid --set=root $ROOT_UUID"
+            echo "    linux $2 $4 ro"
+            [ -n "$3" ] && echo "    initrd $3"
+            echo "}"
+            shift 4
+        done
+    } > "$MNT/boot/grub/grub.cfg"
+}
+
+install_grub_bios() {
+    mkdir -p "$MNT/boot/grub"
+    if in_chroot grub-install --target=i386-pc --boot-directory=/boot \
+            --modules="part_msdos ext2 biosdisk" "$LOOP"; then
+        return 0
+    fi
+    echo "guest grub-install failed — trying the host's grub"
+    [ -d /usr/lib/grub/i386-pc ] || { echo "host has no BIOS grub modules either"; return 1; }
+    grub-install --target=i386-pc --boot-directory="$MNT/boot" \
+        --modules="part_msdos ext2 biosdisk" "$LOOP"
+}
+
+add_vm_user() {
+    # add_vm_user <groups-wanted>
+    local wanted="$1" g have=""
+    for g in $wanted; do
+        if in_chroot getent group "$g" >/dev/null 2>&1; then have="${have:+$have,}$g"; fi
+    done
+    in_chroot id "$VM_USER" >/dev/null 2>&1 || in_chroot useradd -m -G "$have" -s /bin/bash "$VM_USER"
+    printf '%s:%s\nroot:%s\n' "$VM_USER" "$VM_PASS" "$VM_PASS" | in_chroot chpasswd
+}
+
+run_rice_in_chroot() {
+    local extra=("$@")
+    rm -rf "${MNT:?}/root/shastenm-rice"
+    cp -RPp "$WORK_DIR/rice-cd" "$MNT/root/shastenm-rice"
+    echo ">>> running the shastenm rice inside the new system"
+    if in_chroot sh /root/shastenm-rice/run.sh --user "$VM_USER" -y "${extra[@]}" 2>&1 \
+            | tee "$MNT/var/log/shastenm-rice.log"; then
+        echo ">>> rice installed"
+    else
+        echo ">>> rice finished with errors — see /var/log/shastenm-rice.log inside the VM"
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Void Linux — built from the official ROOTFS tarball in a chroot
+# -----------------------------------------------------------------------------
+build_void_image() {
+    local img="$1" size="$2"
+    img_prepare "$img" "$size" void
+    echo ">>> unpacking $(basename "$VOID_ROOTFS")"
+    tar xpf "$VOID_ROOTFS" --xattrs --xattrs-include='*' --numeric-owner -C "$MNT"
+    chroot_prepare
+
+    # generic initramfs (not tied to the Proxmox host's hardware) with virtio
+    mkdir -p "$MNT/etc/dracut.conf.d"
+    printf 'hostonly="no"\nadd_drivers+=" virtio_pci virtio_scsi virtio_blk virtio_net sd_mod ext4 "\n' \
+        > "$MNT/etc/dracut.conf.d/10-shastenm.conf"
+
+    echo ">>> installing base-system + kernel + grub"
+    in_chroot xbps-install -Syu xbps
+    in_chroot xbps-install -yu
+    in_chroot xbps-install -y base-system grub
+    in_chroot xbps-remove -y base-container-full 2>/dev/null || in_chroot xbps-remove -y base-voidstrap 2>/dev/null || true
+    in_chroot xbps-reconfigure -fa
+
+    echo ">>> configuring system"
+    echo "void-shastenm" > "$MNT/etc/hostname"
+    printf 'UUID=%s / ext4 defaults 0 1\ntmpfs /tmp tmpfs defaults,nosuid,nodev 0 0\n' "$ROOT_UUID" > "$MNT/etc/fstab"
+    if [ -f "$MNT/etc/default/libc-locales" ]; then
+        sed -i 's/^#en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' "$MNT/etc/default/libc-locales"
+        in_chroot xbps-reconfigure -f glibc-locales || true
+    fi
+    sed -i 's|^#\{0,1\}TIMEZONE=.*|TIMEZONE="America/Indiana/Indianapolis"|' "$MNT/etc/rc.conf" 2>/dev/null || true
+    add_vm_user "wheel audio video input cdrom storage network"
+    mkdir -p "$MNT/etc/sudoers.d"
+    echo '%wheel ALL=(ALL:ALL) ALL' > "$MNT/etc/sudoers.d/wheel"; chmod 440 "$MNT/etc/sudoers.d/wheel"
+    local s
+    for s in dhcpcd sshd; do
+        [ -d "$MNT/etc/sv/$s" ] && ln -sfn "/etc/sv/$s" "$MNT/etc/runit/runsvdir/default/$s"
+    done
+
+    echo ">>> bootloader"
+    install_grub_bios
+    local kver
+    kver="$(ls "$MNT/boot" | sed -n 's/^vmlinuz-//p' | sort -V | tail -n1)"
+    [ -n "$kver" ] || { echo "no kernel in /boot"; return 1; }
+    [ -f "$MNT/boot/initramfs-$kver.img" ] || in_chroot dracut -f "/boot/initramfs-$kver.img" "$kver"
+    write_grub_cfg "Void Linux" "/boot/vmlinuz-$kver" "/boot/initramfs-$kver.img" "root=UUID=$ROOT_UUID"
+
+    run_rice_in_chroot
+    img_cleanup
+}
+
+# -----------------------------------------------------------------------------
+# Slackware — packages installed from the DVD straight into the new disk
+# -----------------------------------------------------------------------------
+build_slackware_image() {
+    local img="$1" size="$2"
+    img_prepare "$img" "$size" slackware
+    SRCMNT="$WORK_DIR/mnt-slackdvd"; mkdir -p "$SRCMNT"
+    mount -o loop,ro "$ISO_DIR/$ISO_SLACK" "$SRCMNT"
+    local tree; tree="$(find "$SRCMNT" -maxdepth 1 -type d -name 'slackware64' | head -n1)"
+    [ -n "$tree" ] || { echo "no slackware64/ on the DVD"; return 1; }
+
+    local tools="$WORK_DIR/pkgtools"
+    rm -rf "${tools:?}"; mkdir -p "$tools"
+    tar xf "$(ls "$tree"/a/pkgtools-*.t?z | head -n1)" -C "$tools"
+
+    # a ap d l n x xap xfce = a full desktop install without KDE, TeX, Emacs, games
+    local series list=()
+    for series in a ap d l n x xap xfce; do
+        [ -d "$tree/$series" ] || continue
+        while IFS= read -r f; do list+=("$f"); done < <(ls "$tree/$series"/*.t?z 2>/dev/null | sort)
+    done
+    echo ">>> installing ${#list[@]} Slackware packages (takes a while)"
+    ROOT="$MNT" "$tools/sbin/installpkg" --root "$MNT" --terse "${list[@]}" >/dev/null
+    umount "$SRCMNT"; SRCMNT=""
+
+    chroot_prepare
+    in_chroot /sbin/ldconfig || true
+
+    echo ">>> configuring system"
+    echo "slackware-shastenm.lan" > "$MNT/etc/HOSTNAME"
+    printf '/dev/sda1 / ext4 defaults 1 1\ndevpts /dev/pts devpts gid=5,mode=620 0 0\nproc /proc proc defaults 0 0\ntmpfs /dev/shm tmpfs nosuid,nodev,noexec 0 0\n' > "$MNT/etc/fstab"
+    sed -i 's/^USE_DHCP\[0\]=""/USE_DHCP[0]="yes"/' "$MNT/etc/rc.d/rc.inet1.conf" 2>/dev/null || true
+    ln -sf /usr/share/zoneinfo/America/Indiana/Indianapolis "$MNT/etc/localtime"
+    add_vm_user "users wheel audio video cdrom plugdev netdev power lp scanner"
+    in_chroot usermod -g users "$VM_USER" 2>/dev/null || true
+    chmod +x "$MNT/etc/rc.d/rc.sshd" 2>/dev/null || true
+
+    echo ">>> bootloader"
+    install_grub_bios
+    local huge gen kver
+    huge="$(ls "$MNT"/boot/vmlinuz-huge-* 2>/dev/null | sort -V | tail -n1)"
+    gen="$(ls "$MNT"/boot/vmlinuz-generic-* 2>/dev/null | sort -V | tail -n1)"
+    [ -n "$huge" ] || { echo "no huge kernel in /boot"; return 1; }
+    if [ -n "$gen" ]; then
+        kver="${gen##*/vmlinuz-generic-}"
+        in_chroot mkinitrd -c -k "$kver" -f ext4 -r /dev/sda1 \
+            -m virtio_pci:virtio_scsi:sd_mod:ext4 -u -o /boot/initrd.gz >/dev/null 2>&1 || true
+    fi
+    if [ -n "$gen" ] && [ -f "$MNT/boot/initrd.gz" ]; then
+        write_grub_cfg "Slackware (huge)"    "/boot/${huge##*/}" "" "root=/dev/sda1" \
+                       "Slackware (generic)" "/boot/${gen##*/}"  "/boot/initrd.gz" "root=/dev/sda1"
+    else
+        write_grub_cfg "Slackware (huge)"    "/boot/${huge##*/}" "" "root=/dev/sda1"
+    fi
+
+    local extra=(); [ "$WITH_SPECTRWM_SLACK" -eq 1 ] && extra+=(--with-spectrwm)
+    run_rice_in_chroot "${extra[@]}"
+    img_cleanup
+}
+
+# -----------------------------------------------------------------------------
+# FreeBSD — its own installer, made unattended with an installerconfig
+# -----------------------------------------------------------------------------
+build_freebsd_iso() {
+    local out="$ISO_DIR/freebsd-shastenm-auto.iso" cfg="$WORK_DIR/installerconfig"
+    cat > "$cfg" <<'EOF'
+PARTITIONS=da0
+DISTRIBUTIONS="kernel.txz base.txz"
+export nonInteractive="YES"
+
+#!/bin/sh
+sysrc hostname="freebsd-shastenm"
+sysrc ifconfig_DEFAULT="SYNCDHCP"
+sysrc sshd_enable="YES"
+echo '@PASS@' | pw usermod root -h 0
+pw useradd @USER@ -m -G wheel,operator,video -s /bin/sh -c "@USER@"
+echo '@PASS@' | pw usermod @USER@ -h 0
+touch /var/db/shastenm-firstboot
+cat > /etc/rc.local <<'RCEOF'
+#!/bin/sh
+# shastenm rice — runs once on first boot, log: /var/log/shastenm-rice.log
+if [ -f /var/db/shastenm-firstboot ]; then
+    (
+        sleep 10
+        mkdir -p /mnt/rice
+        if mount -t cd9660 /dev/iso9660/SHASTENM /mnt/rice; then
+            sh /mnt/rice/run.sh --user @USER@ -y && rm -f /var/db/shastenm-firstboot
+            umount /mnt/rice
+        fi
+    ) > /var/log/shastenm-rice.log 2>&1 &
+fi
+RCEOF
+chmod +x /etc/rc.local
+EOF
+    sed -i "s/@USER@/$VM_USER/g; s/@PASS@/$VM_PASS/g" "$cfg"
+    rm -f "${out:?}"
+    xorriso -indev "$ISO_DIR/$ISO_FBSD" -outdev "$out" \
+        -map "$cfg" /etc/installerconfig -boot_image any replay >/dev/null 2>&1 \
+        || { warn "Couldn't build the unattended FreeBSD ISO"; return 1; }
+    ISO_FBSD_AUTO="$(basename "$out")"
+    ok "Unattended FreeBSD installer → $PVE_ISO_STORAGE:iso/$ISO_FBSD_AUTO"
+}
+
+# -----------------------------------------------------------------------------
+# Build one VM: image → Proxmox disk → start
+# -----------------------------------------------------------------------------
+pve_auto_vm() {
+    # pve_auto_vm <name> <builder|freebsd> <size> <mem>
+    local name="$1" builder="$2" size="$3" mem="$4" id log rc
+    id="$(pve_existing_vm "$name")"
+    if [ -n "$id" ]; then
+        ok "$name already exists (VM $id) — leaving it alone (use --rebuild to start over)"
+        VM_STATE[$name]="exists"; VM_IDS+=("$id:$name"); return 0
+    fi
+    log="$WORK_DIR/logs/$name.log"; mkdir -p "$WORK_DIR/logs"
     id="$(pvesh get /cluster/nextid)"
-    qm create "$id" --name "$name" --tags shastenm \
-        --memory "$mem" --cores 2 --cpu host --ostype "$ostype" \
-        --scsihw virtio-scsi-single --scsi0 "$PVE_STORAGE:$size,discard=on,iothread=1" \
-        --net0 "virtio,bridge=$PVE_BRIDGE" --vga std \
-        --ide2 "$PVE_ISO_STORAGE:iso/$iso,media=cdrom" \
-        --ide0 "$PVE_ISO_STORAGE:iso/shastenm-rice.iso,media=cdrom" \
-        --boot 'order=scsi0;ide2' >/dev/null
-    ok "Created VM $id  $name  (${size}G disk on $PVE_STORAGE, ${mem}M RAM, $PVE_BRIDGE)"
+
+    if [ "$builder" = freebsd ]; then
+        [ -n "$ISO_FBSD" ] || { warn "$name: FreeBSD ISO missing — skipping"; VM_STATE[$name]="skipped (no ISO)"; return 0; }
+        build_freebsd_iso || { VM_STATE[$name]="failed (ISO remaster)"; return 0; }
+        qm create "$id" --name "$name" --tags shastenm \
+            --memory "$mem" --cores 2 --cpu host --ostype other \
+            --scsihw virtio-scsi-single --scsi0 "$PVE_STORAGE:$size,discard=on,iothread=1" \
+            --net0 "virtio,bridge=$PVE_BRIDGE" --vga std \
+            --ide2 "$PVE_ISO_STORAGE:iso/$ISO_FBSD_AUTO,media=cdrom" \
+            --ide0 "$PVE_ISO_STORAGE:iso/shastenm-rice.iso,media=cdrom" \
+            --boot 'order=scsi0;ide2' >/dev/null
+        ok "Created VM $id $name — it installs itself, reboots, then installs the rice"
+        VM_STATE[$name]="selfinstall"
+    else
+        local need_k free_k
+        need_k=$(( 14 * 1048576 ))
+        free_k="$(df -Pk "$WORK_DIR" | awk 'NR==2{print $4}')"
+        if [ "$free_k" -lt "$need_k" ]; then
+            warn "$name: only $((free_k/1048576))G free in $WORK_DIR (needs ~14G to build) — skipping"
+            VM_STATE[$name]="skipped (host disk full)"; return 0
+        fi
+        local img="$WORK_DIR/$name.raw"
+        section "Building $name (log: $log)"
+        set +e
+        ( set -euo pipefail; trap img_cleanup EXIT; "$builder" "$img" "$size" ) > >(tee "$log") 2>&1
+        rc=$?
+        set -e
+        sleep 1
+        if [ "$rc" -ne 0 ]; then
+            warn "$name build failed (code $rc) — see $log"
+            VM_STATE[$name]="failed — see $log"
+            rm -f "${img:?}"; return 0
+        fi
+        info "Importing $name disk into $PVE_STORAGE"
+        qm create "$id" --name "$name" --tags shastenm \
+            --memory "$mem" --cores 2 --cpu host --ostype l26 \
+            --scsihw virtio-scsi-single --scsi0 "$PVE_STORAGE:0,import-from=$img,discard=on,iothread=1" \
+            --net0 "virtio,bridge=$PVE_BRIDGE" --vga std \
+            --boot 'order=scsi0' >/dev/null
+        rm -f "${img:?}"
+        ok "Created VM $id $name — already installed with the rice"
+        VM_STATE[$name]="ready"
+    fi
     VM_IDS+=("$id:$name")
 }
 
 proxmox_main() {
     [ "$(id -u)" -eq 0 ] || err "On Proxmox run this as root (the web shell already is)."
     DISTRO="proxmox"
-    ok "Detected: Proxmox VE $(pveversion 2>/dev/null | cut -d/ -f2) on $(hostname) — setting up Void, Slackware and FreeBSD VMs"
+    ok "Detected: Proxmox VE $(pveversion 2>/dev/null | cut -d/ -f2) on $(hostname) — auto-installing Void, Slackware and FreeBSD VMs ($VM_USER / $VM_PASS)"
     info "(The rice itself goes inside the VMs, not on the hypervisor.)"
     mkdir -p "$WORK_DIR"
 
@@ -1021,9 +1352,22 @@ proxmox_main() {
         host_mem="$(awk '/^MemTotal:/{print int($2/1024)}' /proc/meminfo)"
         mem=4096; if [ "$host_mem" -lt 16384 ]; then mem=2048; fi
 
-        pve_create_vm "void-shastenm"      l26   "$ISO_VOID"  "$size" "$mem"
-        pve_create_vm "slackware-shastenm" l26   "$ISO_SLACK" "$size" "$mem"
-        pve_create_vm "freebsd-shastenm"   other "$ISO_FBSD"  "$size" "$mem"
+        if [ "$PVE_REBUILD" -eq 1 ]; then
+            pve_destroy_named void-shastenm
+            pve_destroy_named slackware-shastenm
+            pve_destroy_named freebsd-shastenm
+        fi
+        if [ -n "$VOID_ROOTFS" ]; then
+            pve_auto_vm "void-shastenm" build_void_image "$size" "$mem"
+        else
+            warn "void-shastenm: Void ROOTFS missing — skipping"; VM_STATE[void-shastenm]="skipped (no ROOTFS)"
+        fi
+        if [ -n "$ISO_SLACK" ]; then
+            pve_auto_vm "slackware-shastenm" build_slackware_image "$size" "$mem"
+        else
+            warn "slackware-shastenm: Slackware DVD missing — skipping"; VM_STATE[slackware-shastenm]="skipped (no DVD)"
+        fi
+        pve_auto_vm "freebsd-shastenm" freebsd "$size" "$mem"
 
         if [ "$PVE_START" -eq 1 ]; then
             local v
@@ -1047,16 +1391,29 @@ proxmox_main() {
     echo "    shastenm-rice.iso"
     if [ ${#VM_IDS[@]} -gt 0 ]; then
         echo ""
-        echo "  VMs (open each one's Console in the web UI):"
+        echo "  VMs (Console in the web UI, or ssh $VM_USER@<vm-ip>):"
         local v; for v in "${VM_IDS[@]}"; do echo "    ${v%%:*}  ${v#*:}"; done
     fi
     echo ""
-    echo -e "${YELLOW}In each VM:${NC}"
-    echo "  1. Install the OS from the first disc (create your user, e.g. ethan)."
-    echo "  2. Reboot, log in as root, then run the rice from the second disc:"
-    echo "       Void / Slackware : mount /dev/disk/by-label/SHASTENM /mnt && sh /mnt/run.sh"
-    echo "       FreeBSD          : mount -t cd9660 /dev/iso9660/SHASTENM /mnt && sh /mnt/run.sh"
-    echo "     (Slackware gets the CLI rice on XFCE; add --with-spectrwm for his desktop.)"
+    echo -e "${YELLOW}Logins:${NC} $VM_USER / $VM_PASS   (root / $VM_PASS)"
+    local n st
+    for n in void-shastenm slackware-shastenm freebsd-shastenm; do
+        st="${VM_STATE[$n]:-not created}"
+        case "$st" in
+            ready)
+                case "$n" in
+                    void-*)  echo "  $n      — installed + riced. Log in on the console, then: startx" ;;
+                    slack*)  echo "  $n — installed + riced (CLI rice on XFCE). Log in, then: startxfce4" ;;
+                esac ;;
+            selfinstall)
+                echo "  $n   — installs itself (~5-10 min), reboots, then installs the"
+                echo "                       rice in the background: tail -f /var/log/shastenm-rice.log"
+                echo "                       When it finishes: log in as $VM_USER, then startx" ;;
+            exists) echo "  $n — already existed, left untouched (--rebuild to redo it)" ;;
+            *)      echo -e "  $n — ${RED}$st${NC}" ;;
+        esac
+    done
+    echo "  Build logs: $WORK_DIR/logs/"
     echo ""
 }
 
