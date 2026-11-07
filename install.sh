@@ -47,6 +47,8 @@ fi
 #   --offline         no git clones / downloads at all
 #   --with-spectrwm   Slackware only: also deploy the spectrwm desktop
 #   --nvim <distro>   Neovim distro to activate (default: astro)
+#   --dmenu-scripts <dir|zip>  his dmenu_scripts repo (sm-pdf, sm-dots, …);
+#                     auto-found next to the script / in ~/Downloads, or cloned
 #   --user <name>     who gets the dotfiles when started as root
 #                     (default: the user who ran sudo/doas, or the only /home user)
 #   --isos [dir]      first download + verify the latest Void (glibc), Slackware64
@@ -102,7 +104,7 @@ sed_i() {
 DO_PACKAGES=1; DO_FONTS=1; OFFLINE=0; ASSUME_YES=0; WITH_SPECTRWM_SLACK=0
 NVIM_DISTRO="astro"
 POSITIONAL=()
-TARGET_USER=""; USER_PHASE=0; ISO_MODE=0; ISO_DIR=""
+TARGET_USER=""; USER_PHASE=0; ISO_MODE=0; ISO_DIR=""; ARG_DMENU_SCRIPTS=""; DMENU_SCRIPTS_ROOT=""
 PVE_STORAGE=""; PVE_ISO_STORAGE=""; PVE_BRIDGE=""; PVE_VMS=1; PVE_START=1
 VM_USER="ethan"; VM_PASS="1234"; PVE_REBUILD=0
 
@@ -113,6 +115,7 @@ while [ $# -gt 0 ]; do
         --offline)       OFFLINE=1 ;;
         --with-spectrwm) WITH_SPECTRWM_SLACK=1 ;;
         --nvim)          shift; NVIM_DISTRO="${1:?--nvim needs a distro name}" ;;
+        --dmenu-scripts) shift; ARG_DMENU_SCRIPTS="${1:?--dmenu-scripts needs a path}" ;;
         -y|--yes)        ASSUME_YES=1 ;;
         --user)          shift; TARGET_USER="${1:?--user needs a user name}" ;;
         --user-phase)    USER_PHASE=1 ;;                       # internal
@@ -149,6 +152,7 @@ SPECTRWM_DEST="$HOME/.config/spectrwm"
 # (space-separated: tried in order)
 REPO_DOTFILES_BSD="${REPO_DOTFILES_BSD:-https://gitlab.com/smothermonethan2002/dotfiles-bsd.git https://gitlab.com/shastenm/dotfiles-bsd.git}"
 REPO_SPECTRWM_BSD="${REPO_SPECTRWM_BSD:-https://gitlab.com/smothermonethan2002/spectrwm-bsd.git https://gitlab.com/shastenm/spectrwm-bsd.git}"
+REPO_DMENU_SCRIPTS="${REPO_DMENU_SCRIPTS:-https://gitlab.com/smothermonethan2002/dmenu_scripts.git https://gitlab.com/shastenm/dmenu_scripts.git}"
 REPO_DMENU="${REPO_DMENU:-https://gitlab.com/shastenm/dmenu-solarized.git https://gitlab.com/smothermonethan2002/dmenu-solarized.git}"
 REPO_BIN="${REPO_BIN:-https://gitlab.com/cuauhtlios/bin.git}"
 REPO_WALLPAPERS=("https://gitlab.com/shastenm/wallpaper.git" "https://gitlab.com/smothermonethan2002/wallpaper.git")
@@ -210,6 +214,9 @@ VOID_PKGS=(
     # shell / CLI
     tmux neovim fzf bat eza starship fastfetch zk zathura zathura-pdf-mupdf
     ripgrep fd lazygit nodejs python3 fuse-sshfs timeshift
+    # used by his dmenu scripts (sm-dots/sm-dmscr → alacritty, sm-pdf → evince,
+    # sm-man → ps2pdf + zathura, notify-send, sm-ytf → ytfzf)
+    alacritty evince libnotify ghostscript jq ytfzf
     # fonts
     noto-fonts-cjk noto-fonts-emoji dejavu-fonts-ttf
     # build deps for dmenu-solarized / dzen2 / spectrwm fallback
@@ -224,6 +231,7 @@ FREEBSD_PKGS=(
     kitty wezterm ghostty
     tmux neovim fzf bat eza starship fastfetch zk zathura zathura-pdf-mupdf
     ripgrep fd-find lazygit node python3 fusefs-sshfs
+    alacritty evince libnotify ghostscript10 jq ytfzf
     noto-sc noto-emoji dejavu joypixels
     libX11 libXft libXinerama freetype2 fontconfig
 )
@@ -295,7 +303,8 @@ install_starship_fallback() {
 # =============================================================================
 # find_root <marker> <repo-name> <explicit-arg> <git-url>  → echoes path
 find_root() {
-    local marker="$1" name="$2" arg="$3" url="$4" c z
+    # find_root <marker> <name> <arg> <urls> [optional]
+    local marker="$1" name="$2" arg="$3" url="$4" optional="${5:-}" c z
 
     extract_zip() {
         local zip="$1" dest="$WORK_DIR/src/$name"
@@ -319,10 +328,13 @@ find_root() {
         if [ -e "$c/$marker" ]; then (cd "$c" && pwd); return; fi
     done
 
-    for z in "$SCRIPT_DIR"/*"$name"*.zip "$PWD"/*"$name"*.zip "$HOME/Downloads"/*"$name"*.zip \
-             "$TARGET_HOME"/*"$name"*.zip "$TARGET_HOME/Downloads"/*"$name"*.zip; do
+    # newest download first (you may have several copies of the same repo)
+    local zips
+    zips="$(ls -t "$SCRIPT_DIR"/*"$name"*.zip "$PWD"/*"$name"*.zip "$HOME/Downloads"/*"$name"*.zip \
+             "$TARGET_HOME"/*"$name"*.zip "$TARGET_HOME/Downloads"/*"$name"*.zip 2>/dev/null | awk '!seen[$0]++' || true)"
+    while IFS= read -r z; do
         [ -f "$z" ] && extract_zip "$z" && return
-    done
+    done <<<"$zips"
 
     if [ "$OFFLINE" -eq 0 ] && have git; then
         local dest="$WORK_DIR/src/$name" u
@@ -334,6 +346,7 @@ find_root() {
             fi
         done
     fi
+    [ -n "$optional" ] && return 0
     err "Cannot find $name.\nUsage: $0 <path-to-dotfiles-bsd-main> <path-to-spectrwm-bsd-main>"
 }
 
@@ -579,6 +592,24 @@ build_spectrwm_if_missing() {
     clone_or_pull "$REPO_SPECTRWM_SRC" "$d" || { warn "Couldn't clone spectrwm"; return 0; }
     (cd "$d/linux" && make && $SUDO make install) \
         && ok "spectrwm installed" || warn "spectrwm build failed (needs libbsd-devel + X11 headers)"
+}
+
+deploy_dmenu_scripts() {
+    [ -n "$DMENU_SCRIPTS_ROOT" ] || return 0
+    section "dmenu scripts  ($DMENU_SCRIPTS_ROOT → ~/.local/bin/dmenu)"
+    local d="$HOME/.local/bin/dmenu" f n
+    mkdir -p "$d"
+    for f in "$DMENU_SCRIPTS_ROOT"/*; do
+        [ -f "$f" ] || continue
+        n="$(basename "$f")"
+        case "$n" in README*|LICENSE*|*.md) continue ;; esac
+        if [ -f "$d/$n" ] && ! cmp -s "$f" "$d/$n"; then backup_path "$d/$n"; fi
+        cp -p "$f" "$d/$n"; chmod +x "$d/$n"
+        ln -sfn "dmenu/$n" "$HOME/.local/bin/$n"
+    done
+    # his sm-dots / sm-dmscr open files in alacritty; sm-pdf browses ~/.pdf
+    mkdir -p "$HOME/.pdf"
+    ok "sm-pdf, sm-man, sm-dots, sm-dmscr, rdmenu, … installed (rdmenu = his rofi launcher)"
 }
 
 install_sm_scripts() {
@@ -982,7 +1013,8 @@ build_rice_iso() {
     cp "$SELF" "$stage/install.sh"
     cp -RPp "$DOTFILES_ROOT" "$stage/dotfiles-bsd-main"
     cp -RPp "$SPECTRWM_ROOT" "$stage/spectrwm-bsd-main"
-    rm -rf "${stage:?}/dotfiles-bsd-main/.git" "${stage:?}/spectrwm-bsd-main/.git"
+    [ -n "$DMENU_SCRIPTS_ROOT" ] && cp -RPp "$DMENU_SCRIPTS_ROOT" "$stage/dmenu_scripts-main"
+    rm -rf "${stage:?}/dotfiles-bsd-main/.git" "${stage:?}/spectrwm-bsd-main/.git" "${stage:?}/dmenu_scripts-main/.git"
     cat > "$stage/run.sh" <<'EOF'
 #!/bin/sh
 # shastenm rice — run as root inside the new VM after the OS is installed:
@@ -994,6 +1026,7 @@ SRC="$(cd "$(dirname "$0")" && pwd)"
 W=/tmp/shastenm-rice
 rm -rf "${W:?}"; mkdir -p "$W"
 cp -R "$SRC/install.sh" "$SRC/dotfiles-bsd-main" "$SRC/spectrwm-bsd-main" "$W/"
+[ -d "$SRC/dmenu_scripts-main" ] && cp -R "$SRC/dmenu_scripts-main" "$W/"
 chmod -R u+w "$W"
 if ! command -v bash >/dev/null 2>&1; then
     if [ "$(uname -s)" = FreeBSD ]; then
@@ -1003,6 +1036,7 @@ if ! command -v bash >/dev/null 2>&1; then
         echo "bash is missing — install it first"; exit 1
     fi
 fi
+if [ -d "$W/dmenu_scripts-main" ]; then set -- --dmenu-scripts "$W/dmenu_scripts-main" "$@"; fi
 exec bash "$W/install.sh" "$@" "$W/dotfiles-bsd-main" "$W/spectrwm-bsd-main"
 EOF
     chmod +x "$stage/run.sh" "$stage/install.sh"
@@ -1026,6 +1060,18 @@ pve_destroy_named() {
     warn "--rebuild: destroying VM $id ($name)"
     qm stop "$id" >/dev/null 2>&1 || true
     qm destroy "$id" --purge 1 --destroy-unreferenced-disks 1 >/dev/null
+}
+
+pve_vol_exists() {
+    # pve_vol_exists <storage:iso/file.iso>
+    local f; f="$(pvesm path "$1" 2>/dev/null || true)"
+    [ -n "$f" ] && [ -f "$f" ]
+}
+
+pve_missing_media() {
+    # print every CD/DVD volume a VM uses that isn't actually in storage
+    qm config "$1" 2>/dev/null | sed -n 's/^\(ide[0-9]\|sata[0-9]\|scsi[0-9]\): \([^,]*:iso\/[^,]*\),.*/\2/p' \
+        | while IFS= read -r v; do pve_vol_exists "$v" || echo "$v"; done
 }
 
 pve_existing_vm() {
@@ -1100,9 +1146,16 @@ iso_extract() {
 
 iso_label() { xorriso -indev "$1" -pvd_info 2>/dev/null | sed -n 's/^Volume Id *: *//p' | head -n1; }
 
+# Plain ISO9660 names must stay exactly as on the original disc: ISOLINUX
+# looks files up by them, and xorriso's defaults would turn "bzImage" into
+# "bzImage.;1" ("Could not find kernel image: /kernels/huge.s/bzImage").
+ISO_COMPLIANCE="no_force_dots:omit_version:allow_dir_id_ext:lowercase:full_ascii:iso_9660_level=3"
+ISO_MUST=()   # extra files (e.g. the kernel) that must exist in a remastered ISO
+
 iso_ok() {
     # iso_ok <iso> <path-in-iso>... — exists, still bootable, contains every path
     local iso="$1"; shift
+    set -- "$@" "${ISO_MUST[@]}"
     [ -s "$iso" ] || return 1
     xorriso -indev "$iso" -report_el_torito plain 2>/dev/null | grep -qi 'boot img' || return 1
     local p
@@ -1114,31 +1167,48 @@ iso_ok() {
 iso_remaster() {
     # iso_remaster <src.iso> <out.iso> <log> "<mkisofs BIOS boot args>" <local> <iso-path> [<local> <iso-path>...]
     # Replaces/adds files in an installer ISO while keeping it bootable.
-    local src="$1" out="$2" xlog="$3" bootargs="$4"; shift 4
+    local src="$1" final="$2" xlog="$3" bootargs="$4"; shift 4
+    # build under a temp name; only replace the real ISO once the new one checks out
+    local out="$final.part.iso"
     local maps=() paths=() a=("$@")
     while [ $# -ge 2 ]; do maps+=(-map "$1" "$2"); paths+=("$2"); shift 2; done
     rm -f "${out:?}"
     # 1) copy the ISO with our files dropped in, replaying its own boot setup.
     #    (xorriso exits non-zero on harmless hybrid-layout warnings, so judge
     #    by checking the result instead of the exit code)
-    xorriso -return_with FAILURE 32 -indev "$src" -outdev "$out" \
+    xorriso -return_with FAILURE 32 -indev "$src" -outdev "$out" -compliance "$ISO_COMPLIANCE" \
         "${maps[@]}" -boot_image any replay > "$xlog" 2>&1 || true
-    iso_ok "$out" "${paths[@]}" && return 0
+    if iso_ok "$out" "${paths[@]}"; then mv -f "$out" "$final"; return 0; fi
     # 2) rebuild it from its files with the OS's BIOS boot loader
     warn "Quick remaster of $(basename "$src") didn't work — rebuilding it from its files (log: $xlog)"
-    local tree="$WORK_DIR/iso-tree" label i
+    # unpack on the ISO storage (it has room for a full DVD; / often doesn't)
+    local tree="$ISO_DIR/.shastenm-iso-tree" label need_k free_k want got
     label="$(iso_label "$src")"
     rm -rf "${tree:?}"; mkdir -p "$tree"
+    need_k=$(( $(stat -c %s "$src") / 1024 + 1048576 ))
+    free_k="$(df -Pk "$ISO_DIR" | awk 'NR==2{print $4}')"
+    if [ "$free_k" -lt "$need_k" ]; then
+        warn "Not enough room in $ISO_DIR to unpack $(basename "$src") ($((need_k/1048576))G needed)"
+        rm -rf "${tree:?}"; rm -f "${out:?}"; return 1
+    fi
     xorriso -osirrox on -indev "$src" -extract / "$tree" >> "$xlog" 2>&1 || true
     chmod -R u+w "$tree"
+    want="$(xorriso -indev "$src" -find / -type f 2>/dev/null | wc -l)"
+    got="$(find "$tree" -type f | wc -l)"
+    if [ "$got" -lt "$want" ]; then
+        warn "Unpacking $(basename "$src") was incomplete ($got of $want files) — see $xlog"
+        rm -rf "${tree:?}"; rm -f "${out:?}"; return 1
+    fi
     set -- "${a[@]}"
     while [ $# -ge 2 ]; do mkdir -p "$tree$(dirname "$2")"; cp "$1" "$tree$2"; shift 2; done
     rm -f "${out:?}"
     # shellcheck disable=SC2086
-    xorriso -as mkisofs -R -J -joliet-long -V "${label:-INSTALL}" $bootargs -o "$out" "$tree" >> "$xlog" 2>&1 || true
+    xorriso -as mkisofs -iso-level 3 -untranslated-filenames -untranslated_name_len 96 \
+        -R -J -joliet-long -V "${label:-INSTALL}" $bootargs -o "$out" "$tree" >> "$xlog" 2>&1 || true
     rm -rf "${tree:?}"
-    i=0; iso_ok "$out" "${paths[@]}" || i=1
-    return "$i"
+    if iso_ok "$out" "${paths[@]}"; then mv -f "$out" "$final"; return 0; fi
+    rm -f "${out:?}"
+    return 1
 }
 
 initrd_overlay() {
@@ -1196,6 +1266,37 @@ timezone="America/Indiana/Indianapolis"
 keymap="us"
 libclocale="en_US.UTF-8"
 end_action=func
+
+# Replaces the autoinstaller's own GRUB step (this file is loaded inside the
+# installer, so this definition wins). Theirs stops at the first error and can
+# leave a disk with GRUB but no grub.cfg — the empty "grub>" prompt.
+VAI_configure_grub() {
+    echo 'hostonly="no"' > "\${target}/etc/dracut.conf.d/hostonly.conf"
+    echo "[shastenm] installing GRUB on \${disk}"
+    chroot "\${target}" grub-install --target=i386-pc "\${disk}" \
+        || chroot "\${target}" grub-install "\${disk}" || echo "[shastenm] grub-install reported an error"
+    echo "[shastenm] building the initramfs"
+    chroot "\${target}" xbps-reconfigure -fa || echo "[shastenm] xbps-reconfigure reported an error"
+    echo "[shastenm] writing grub.cfg"
+    chroot "\${target}" grub-mkconfig -o /boot/grub/grub.cfg || echo "[shastenm] grub-mkconfig reported an error"
+    if ! grep -q '^[[:space:]]*linux' "\${target}/boot/grub/grub.cfg" 2>/dev/null; then
+        _k="\$(ls "\${target}/boot" | sed -n 's/^vmlinuz-//p' | tail -n1)"
+        _u="\$(blkid -s UUID -o value "\${disk}\${partsep}1")"
+        echo "[shastenm] grub-mkconfig gave no menu — writing one for kernel \${_k}"
+        mkdir -p "\${target}/boot/grub"
+        {
+            echo "set timeout=3"
+            echo "insmod part_msdos"
+            echo "insmod ext2"
+            echo "search --no-floppy --fs-uuid --set=root \${_u}"
+            echo "menuentry 'Void Linux' {"
+            echo "    linux /boot/vmlinuz-\${_k} root=UUID=\${_u} ro loglevel=4"
+            echo "    initrd /boot/initramfs-\${_k}.img"
+            echo "}"
+        } > "\${target}/boot/grub/grub.cfg"
+    fi
+}
+
 end_function() {
     echo "[shastenm] setting up first-boot dotfiles install"
     echo "root:$VM_PASS" | chpasswd -c SHA512 -R "\${target}"
@@ -1229,6 +1330,7 @@ EOF
     sh -n "$w/overlay/etc/autoinstall.default" || { warn "Generated Void autoinstall config isn't valid sh"; return 1; }
 
     initrd_overlay "$w/initrd" "$w/initrd.new" "$w/overlay"
+    ISO_MUST=(/boot/vmlinuz /boot/isolinux/isolinux.bin)
     iso_remaster "$src" "$out" "$xlog" \
         "-b boot/isolinux/isolinux.bin -c boot/isolinux/boot.cat -no-emul-boot -boot-load-size 4 -boot-info-table" \
         "$w/isolinux.cfg" /boot/isolinux/isolinux.cfg "$w/initrd.new" /boot/initrd \
@@ -1394,6 +1496,8 @@ EOF
     sh -n "$w/overlay/shastenm/autoinstall.sh" || { warn "Generated Slackware install script isn't valid sh"; return 1; }
 
     initrd_overlay "$w/initrd.img" "$w/initrd.new" "$w/overlay"
+    local kern; kern="$(awk 'tolower($1)=="kernel"{print $2; exit}' "$w/isolinux.cfg")"
+    ISO_MUST=(/isolinux/isolinux.bin "${kern:-/kernels/huge.s/bzImage}")
     iso_remaster "$src" "$out" "$xlog" \
         "-b isolinux/isolinux.bin -c isolinux/isolinux.boot -no-emul-boot -boot-load-size 4 -boot-info-table" \
         "$w/isolinux.cfg" /isolinux/isolinux.cfg "$w/initrd.new" /isolinux/initrd.img \
@@ -1452,6 +1556,7 @@ EOF
     sed -i -e "/^@FIRSTBOOT@\$/{r $fb" -e 'd;}' "$cfg"
     local src="$ISO_DIR/$ISO_FBSD" xlog="$WORK_DIR/logs/freebsd-remaster.log"
     mkdir -p "$WORK_DIR/logs"
+    ISO_MUST=(/boot/cdboot /boot/kernel/kernel)
     iso_remaster "$src" "$out" "$xlog" "-b boot/cdboot -no-emul-boot" "$cfg" /etc/installerconfig \
         || { warn "Couldn't build the unattended FreeBSD ISO — see $xlog"; return 1; }
     ISO_FBSD_AUTO="$(basename "$out")"
@@ -1466,8 +1571,13 @@ pve_auto_vm() {
     local name="$1" kind="$2" size="$3" mem="$4" id iso ostype nic diskopt bootdev
     id="$(pve_existing_vm "$name")"
     if [ -n "$id" ]; then
-        ok "$name already exists (VM $id) — leaving it alone (use --rebuild to start over)"
-        VM_STATE[$name]="exists"; VM_IDS+=("$id:$name"); return 0
+        local missing; missing="$(pve_missing_media "$id")"
+        if [ -z "$missing" ]; then
+            ok "$name already exists (VM $id) — leaving it alone (use --rebuild to start over)"
+            VM_STATE[$name]="exists"; VM_IDS+=("$id:$name"); return 0
+        fi
+        warn "$name (VM $id) points at ISO(s) that aren't in storage: $(echo $missing)"
+        warn "  → rebuilding its installer ISO and re-attaching the discs"
     fi
     section "Preparing $name"
     case "$kind" in
@@ -1488,6 +1598,13 @@ pve_auto_vm() {
             iso="$ISO_FBSD_AUTO"; ostype=other; nic=virtio
             diskopt=(--scsihw virtio-scsi-single --scsi0 "$PVE_STORAGE:$size,discard=on,iothread=1"); bootdev=scsi0 ;;
     esac
+    pve_vol_exists "$PVE_ISO_STORAGE:iso/$iso" || { warn "$name: $iso didn't land in $PVE_ISO_STORAGE"; VM_STATE[$name]="failed (installer ISO missing)"; return 0; }
+    if [ -n "$id" ]; then
+        qm set "$id" --ide2 "$PVE_ISO_STORAGE:iso/$iso,media=cdrom" \
+                     --ide0 "$PVE_ISO_STORAGE:iso/shastenm-rice.iso,media=cdrom" >/dev/null
+        ok "Re-attached $iso + shastenm-rice.iso to VM $id ($name)"
+        VM_STATE[$name]="selfinstall"; VM_IDS+=("$id:$name"); return 0
+    fi
     id="$(pvesh get /cluster/nextid)"
     qm create "$id" --name "$name" --tags shastenm \
         --memory "$mem" --cores 2 --cpu host --ostype "$ostype" \
@@ -1518,7 +1635,10 @@ proxmox_main() {
 
     DOTFILES_ROOT="$(find_root ".config/nvim-configs" "dotfiles-bsd-main" "$ARG_DOTFILES" "$REPO_DOTFILES_BSD")"
     SPECTRWM_ROOT="$(find_root "spectrwm.conf" "spectrwm-bsd-main" "$ARG_SPECTRWM" "$REPO_SPECTRWM_BSD")"
+    DMENU_SCRIPTS_ROOT="$(find_root "sm-dmscr" "dmenu_scripts-main" "$ARG_DMENU_SCRIPTS" "$REPO_DMENU_SCRIPTS" optional)"
     info "Dotfiles root : $DOTFILES_ROOT"
+    if [ -n "$DMENU_SCRIPTS_ROOT" ]; then info "dmenu scripts : $DMENU_SCRIPTS_ROOT"
+    else warn "dmenu_scripts not found — sm-pdf / sm-dots / sm-dmscr / sm-man won't be installed"; fi
     info "Spectrwm root : $SPECTRWM_ROOT"
     build_rice_iso
 
@@ -1554,9 +1674,15 @@ proxmox_main() {
         if [ "$PVE_START" -eq 1 ]; then
             local v
             for v in "${VM_IDS[@]}"; do
-                if ! qm status "${v%%:*}" | grep -q running; then
-                    qm start "${v%%:*}" && ok "Started ${v#*:} (VM ${v%%:*})" || warn "Couldn't start ${v#*:}"
+                if qm status "${v%%:*}" | grep -q running; then continue; fi
+                local miss; miss="$(pve_missing_media "${v%%:*}")"
+                if [ -n "$miss" ]; then
+                    warn "Not starting ${v#*:}: missing $(echo $miss) — re-run the script to rebuild it"
+                    VM_STATE[${v#*:}]="not started (missing $(echo $miss))"
+                    continue
                 fi
+                qm start "${v%%:*}" >/dev/null 2>&1 && ok "Started ${v#*:} (VM ${v%%:*})" \
+                    || warn "Couldn't start ${v#*:} — see: qm start ${v%%:*}"
             done
         fi
     fi
@@ -1644,6 +1770,10 @@ hand_off_to_user() {
     args+=(--nvim "$NVIM_DISTRO")
     cp -RPp "$DOTFILES_ROOT" "$tmp/dotfiles-bsd-main"; args+=("$tmp/dotfiles-bsd-main")
     if [ "$WANT_WM" -eq 1 ]; then cp -RPp "$SPECTRWM_ROOT" "$tmp/spectrwm-bsd-main"; args+=("$tmp/spectrwm-bsd-main"); fi
+    if [ -n "$DMENU_SCRIPTS_ROOT" ]; then
+        cp -RPp "$DMENU_SCRIPTS_ROOT" "$tmp/dmenu_scripts-main"
+        args=(--dmenu-scripts "$tmp/dmenu_scripts-main" "${args[@]}")
+    fi
     chmod -R a+rX "$tmp"
 
     local q="" a
@@ -1714,6 +1844,8 @@ if [ "$WANT_WM" -eq 1 ]; then
     SPECTRWM_ROOT="$(find_root "spectrwm.conf" "spectrwm-bsd-main" "$ARG_SPECTRWM" "$REPO_SPECTRWM_BSD")"
     info "Spectrwm root : $SPECTRWM_ROOT"
 fi
+DMENU_SCRIPTS_ROOT="$(find_root "sm-dmscr" "dmenu_scripts-main" "$ARG_DMENU_SCRIPTS" "$REPO_DMENU_SCRIPTS" optional)"
+[ -n "$DMENU_SCRIPTS_ROOT" ] && info "dmenu scripts : $DMENU_SCRIPTS_ROOT"
 
 if [ "$WANT_WM" -eq 1 ] && [ "$OFFLINE" -eq 0 ] && [ "$CAN_ROOT" -eq 1 ] && [ "$USER_PHASE" -eq 0 ]; then
     build_spectrwm_if_missing
@@ -1728,6 +1860,7 @@ fi
 
 deploy_dotfiles
 [ "$WANT_WM" -eq 1 ] && deploy_spectrwm
+deploy_dmenu_scripts
 [ "$OFFLINE" -eq 0 ] && install_sm_scripts
 [ "$WANT_WM" -eq 1 ] && check_sm_scripts
 setup_tmux
