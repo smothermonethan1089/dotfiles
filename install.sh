@@ -1127,8 +1127,24 @@ add_vm_user() {
     for g in $wanted; do
         if in_chroot getent group "$g" >/dev/null 2>&1; then have="${have:+$have,}$g"; fi
     done
-    in_chroot id "$VM_USER" >/dev/null 2>&1 || in_chroot useradd -m -G "$have" -s /bin/bash "$VM_USER"
-    printf '%s:%s\nroot:%s\n' "$VM_USER" "$VM_PASS" "$VM_PASS" | in_chroot chpasswd
+    echo ">>> creating user $VM_USER (groups: ${have:-none})"
+    if ! in_chroot id "$VM_USER" >/dev/null 2>&1; then
+        in_chroot useradd -m -s /bin/bash "$VM_USER" \
+            || in_chroot useradd -s /bin/bash "$VM_USER" \
+            || { echo "useradd failed inside the new system"; return 1; }
+    fi
+    mkdir -p "$MNT/home/$VM_USER"
+    in_chroot chown "$VM_USER" "/home/$VM_USER" 2>/dev/null || true
+    for g in ${have//,/ }; do in_chroot usermod -a -G "$g" "$VM_USER" 2>/dev/null || true; done
+
+    echo ">>> setting passwords ($VM_USER and root)"
+    if ! printf '%s:%s\nroot:%s\n' "$VM_USER" "$VM_PASS" "$VM_PASS" | in_chroot chpasswd 2>/dev/null; then
+        # no working chpasswd — set the hash directly
+        local hash
+        hash="$(openssl passwd -6 "$VM_PASS" 2>/dev/null || openssl passwd -1 "$VM_PASS")"
+        in_chroot usermod -p "$hash" "$VM_USER"
+        in_chroot usermod -p "$hash" root
+    fi
 }
 
 # -----------------------------------------------------------------------------
@@ -1291,6 +1307,12 @@ build_slackware_image() {
     [ -x "$MNT/usr/bin/env" ] || ln -s ../../bin/env "$MNT/usr/bin/env"
 
     chroot_prepare
+    echo ">>> checking the new Slackware root can run programs"
+    if ! in_chroot /bin/bash -c 'echo "    bash $BASH_VERSION runs inside the new root"'; then
+        echo "can't run /bin/bash inside the new root:"
+        ls -l "$MNT/bin/bash" "$MNT"/lib64/ld-linux* "$MNT/usr/bin/env" 2>&1 | sed 's/^/    /'
+        return 1
+    fi
     mkdir -p "$MNT/mnt/slackdvd"
     mount --bind "$tree" "$MNT/mnt/slackdvd"
     in_chroot /sbin/ldconfig || true
@@ -1357,6 +1379,13 @@ build_slackware_image() {
 # -----------------------------------------------------------------------------
 # FreeBSD — its own installer, made unattended with an installerconfig
 # -----------------------------------------------------------------------------
+fbsd_iso_ok() {
+    # the new ISO exists, carries our installerconfig, and is still bootable
+    [ -s "$1" ] || return 1
+    xorriso -indev "$1" -find /etc/installerconfig 2>/dev/null | grep -q installerconfig || return 1
+    xorriso -indev "$1" -report_el_torito plain 2>/dev/null | grep -qi 'boot img' || return 1
+}
+
 build_freebsd_iso() {
     local out="$ISO_DIR/freebsd-shastenm-auto.iso" cfg="$WORK_DIR/installerconfig"
     cat > "$cfg" <<'EOF'
@@ -1401,10 +1430,32 @@ EOF
     local fb="$WORK_DIR/firstboot.sh"
     firstboot_script > "$fb"
     sed -i -e "/^@FIRSTBOOT@\$/{r $fb" -e 'd;}' "$cfg"
+    local src="$ISO_DIR/$ISO_FBSD" xlog="$WORK_DIR/logs/freebsd-remaster.log"
+    mkdir -p "$WORK_DIR/logs"
     rm -f "${out:?}"
-    xorriso -indev "$ISO_DIR/$ISO_FBSD" -outdev "$out" \
-        -map "$cfg" /etc/installerconfig -boot_image any replay >/dev/null 2>&1 \
-        || { warn "Couldn't build the unattended FreeBSD ISO"; return 1; }
+    # 1) quick way: copy the ISO and drop the config in, keeping its boot setup.
+    #    xorriso exits non-zero on harmless warnings about FreeBSD's hybrid
+    #    layout, so judge by checking the result instead of the exit code.
+    xorriso -return_with FAILURE 32 -indev "$src" -outdev "$out" \
+        -map "$cfg" /etc/installerconfig -boot_image any replay > "$xlog" 2>&1 || true
+    if ! fbsd_iso_ok "$out"; then
+        # 2) rebuild the ISO from its files with FreeBSD's BIOS boot loader
+        warn "Quick FreeBSD remaster didn't work — rebuilding the ISO from its files (log: $xlog)"
+        local tree="$WORK_DIR/fbsd-tree" label
+        rm -rf "${tree:?}"; mkdir -p "$tree"
+        xorriso -osirrox on -indev "$src" -extract / "$tree" >> "$xlog" 2>&1 || true
+        chmod -R u+w "$tree"
+        [ -f "$tree/boot/cdboot" ] || { warn "FreeBSD ISO has no boot/cdboot — can't rebuild it (see $xlog)"; rm -rf "${tree:?}"; return 1; }
+        cp "$cfg" "$tree/etc/installerconfig"
+        # the loader mounts its root by the disc's label, so keep the same label
+        label="$(sed -n 's|.*iso9660/\([A-Za-z0-9_.-]*\).*|\1|p' "$tree/boot/loader.conf" 2>/dev/null | head -n1)"
+        [ -n "$label" ] || label="$(xorriso -indev "$src" -pvd_info 2>/dev/null | sed -n 's/^Volume Id *: *//p' | head -n1)"
+        rm -f "${out:?}"
+        xorriso -as mkisofs -R -V "${label:-FREEBSD_INSTALL}" -b boot/cdboot -no-emul-boot \
+            -o "$out" "$tree" >> "$xlog" 2>&1 || true
+        rm -rf "${tree:?}"
+        fbsd_iso_ok "$out" || { warn "Couldn't build the unattended FreeBSD ISO — see $xlog"; return 1; }
+    fi
     ISO_FBSD_AUTO="$(basename "$out")"
     ok "Unattended FreeBSD installer → $PVE_ISO_STORAGE:iso/$ISO_FBSD_AUTO"
 }
@@ -1447,14 +1498,17 @@ pve_auto_vm() {
         section "Building $name (log: $log)"
         set +e
         ( set -Eeuo pipefail
-          trap 'echo "!!! FAILED at line $LINENO: $BASH_COMMAND"' ERR
+          trap 'echo "!!! FAILED at line $LINENO: $BASH_COMMAND   [in: ${FUNCNAME[*]:-main} | lines: ${BASH_LINENO[*]}]"' ERR
           trap img_cleanup EXIT
           "$builder" "$img" "$size" ) > >(tee "$log") 2>&1
         rc=$?
         set -e
         sleep 1
         if [ "$rc" -ne 0 ]; then
-            local why; why="$(grep '^!!! FAILED' "$log" | head -n1 | sed 's/^!!! //' || true)"
+            local why step
+            why="$(grep '^!!! FAILED' "$log" | head -n1 | sed 's/^!!! //' || true)"
+            step="$(grep '^>>>' "$log" | tail -n1 | sed 's/^>>> //' || true)"
+            [ -n "$step" ] && why="during \"$step\": $why"
             warn "$name build failed (code $rc): ${why:-see log}"
             echo "  ── last lines of $log ──"
             tail -n 15 "$log" | sed 's/^/  │ /'
