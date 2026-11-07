@@ -1159,6 +1159,12 @@ fi
 say "installing the shastenm dotfiles for @USER@ — the VM reboots by itself when done"
 say "watch it:  tail -f $LOG"
 if sh "$RICE/run.sh" --user @USER@ -y @EXTRA@ >> "$LOG" 2>&1; then
+    # his rice lives in ~/.bashrc, so log in to bash (FreeBSD starts users on sh)
+    B="$(command -v bash 2>/dev/null || true)"
+    if [ -n "$B" ]; then
+        grep -qx "$B" /etc/shells 2>/dev/null || echo "$B" >> /etc/shells
+        if command -v pw >/dev/null 2>&1; then pw usermod @USER@ -s "$B"; else usermod -s "$B" @USER@ 2>/dev/null || true; fi
+    fi
     rm -f "$FLAG"
     say "dotfiles installed — rebooting into the riced system"
     sleep 5
@@ -1257,18 +1263,39 @@ build_slackware_image() {
     rm -rf "${tools:?}"; mkdir -p "$tools"
     tar xf "$(ls "$tree"/a/pkgtools-*.t?z | head -n1)" -C "$tools"
 
-    # a ap d l n x xap xfce = a full desktop install without KDE, TeX, Emacs, games
-    local series list=()
-    for series in a ap d l n x xap xfce; do
-        [ -d "$tree/$series" ] || continue
-        while IFS= read -r f; do list+=("$f"); done < <(ls "$tree/$series"/*.t?z 2>/dev/null | sort)
-    done
-    echo ">>> installing ${#list[@]} Slackware packages (takes a while)"
-    ROOT="$MNT" "$tools/sbin/installpkg" --root "$MNT" --terse "${list[@]}" >/dev/null
-    umount "$SRCMNT"; SRCMNT=""
+    # Package install scripts chown files to Slackware's own users/groups
+    # (utmp, shadow, slocate, …) — those only exist INSIDE the new system.
+    # So: 1) lay down the core "a" series from the host just to get a working
+    # bash/coreutils/tar/xz/pkgtools in the new root, then 2) chroot in and
+    # (re)install everything with Slackware's own installpkg.
+    local base=()
+    while IFS= read -r f; do base+=("$f"); done < <(ls "$tree"/a/*.t?z 2>/dev/null | sort)
+    echo ">>> stage 1/2: bootstrapping ${#base[@]} core packages from the host"
+    ROOT="$MNT" "$tools/sbin/installpkg" --root "$MNT" --terse "${base[@]}" >/dev/null 2>&1 || true
+    [ -x "$MNT/sbin/installpkg" ] && [ -x "$MNT/bin/bash" ] || { echo "core bootstrap failed"; return 1; }
 
     chroot_prepare
+    mkdir -p "$MNT/mnt/slackdvd"
+    mount --bind "$tree" "$MNT/mnt/slackdvd"
     in_chroot /sbin/ldconfig || true
+
+    # a ap d l n x xap xfce = a full desktop install without KDE, TeX, Emacs, games
+    local n; n="$(ls "$tree"/{a,ap,d,l,n,x,xap,xfce}/*.t?z 2>/dev/null | wc -l)"
+    echo ">>> stage 2/2: installing $n Slackware packages inside the new system (takes a while)"
+    in_chroot /bin/bash -c '
+        cd /mnt/slackdvd || exit 1
+        /sbin/upgradepkg --reinstall --terse a/*.t?z >/dev/null 2>&1
+        for s in ap d l n x xap xfce; do
+            [ -d "$s" ] || continue
+            echo "    series $s"
+            /sbin/installpkg --terse "$s"/*.t?z >/dev/null 2>&1
+        done
+        /sbin/ldconfig
+        true'
+    umount "$MNT/mnt/slackdvd" 2>/dev/null || umount -l "$MNT/mnt/slackdvd"
+    rmdir "$MNT/mnt/slackdvd" 2>/dev/null || true
+    umount "$SRCMNT"; SRCMNT=""
+    [ -x "$MNT/usr/bin/startxfce4" ] || echo "warning: XFCE didn't install — check the log"
 
     echo ">>> configuring system"
     echo "slackware-shastenm.lan" > "$MNT/etc/HOSTNAME"
@@ -1315,16 +1342,27 @@ build_slackware_image() {
 build_freebsd_iso() {
     local out="$ISO_DIR/freebsd-shastenm-auto.iso" cfg="$WORK_DIR/installerconfig"
     cat > "$cfg" <<'EOF'
-PARTITIONS=da0
+# --- unattended FreeBSD install (shastenm) -----------------------------------
+# virtio-scsi disk = da0. Classic dist sets from the disc (15.x defaults to
+# pkgbase otherwise). If the sets aren't on the disc, fetch them over DHCP.
+PARTITIONS="da0"
 DISTRIBUTIONS="kernel.txz base.txz"
+BSDINSTALL_DISTSITE="https://download.freebsd.org/releases/amd64/@FBSDREL@"
 export nonInteractive="YES"
+if [ ! -f /usr/freebsd-dist/base.txz ]; then
+    for nic in vtnet0 em0; do ifconfig "$nic" >/dev/null 2>&1 && dhclient "$nic" >/dev/null 2>&1 && break; done
+fi
 
 #!/bin/sh
 sysrc hostname="freebsd-shastenm"
 sysrc ifconfig_DEFAULT="SYNCDHCP"
 sysrc sshd_enable="YES"
+sysrc dumpdev="NO"
 echo '@PASS@' | pw usermod root -h 0
-pw useradd @USER@ -m -G wheel,operator,video -s /bin/sh -c "@USER@"
+# only join groups that exist (a missing one would fail the whole step)
+grps="wheel"
+for g in operator video; do pw groupshow "$g" >/dev/null 2>&1 && grps="$grps,$g"; done
+pw useradd @USER@ -m -G "$grps" -s /bin/sh -c "@USER@"
 echo '@PASS@' | pw usermod @USER@ -h 0
 touch /var/db/shastenm-firstboot
 mkdir -p /usr/local/sbin
@@ -1339,7 +1377,8 @@ cat > /etc/rc.local <<'RCEOF'
 RCEOF
 chmod +x /etc/rc.local
 EOF
-    sed -i "s/@USER@/$VM_USER/g; s/@PASS@/$VM_PASS/g" "$cfg"
+    local rel; rel="$(sed -n 's/^FreeBSD-\([0-9.]*-RELEASE\)-.*/\1/p' <<<"$ISO_FBSD")"
+    sed -i "s/@USER@/$VM_USER/g; s/@PASS@/$VM_PASS/g; s/@FBSDREL@/${rel:-15.1-RELEASE}/g" "$cfg"
     # drop the shared first-boot script in place of @FIRSTBOOT@
     local fb="$WORK_DIR/firstboot.sh"
     firstboot_script > "$fb"
