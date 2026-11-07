@@ -915,17 +915,23 @@ download_isos() {
     done
     [ -n "$ISO_SLACK" ] || { warn "Slackware: every mirror failed"; failed=1; }
 
-    # FreeBSD — newest RELEASE, disc1 (full installer, no network needed)
+    # FreeBSD — newest RELEASE that actually has a disc1 + checksum, then older
+    # ones (a brand-new release dir can be listed before its ISOs are uploaded)
+    local vers v
     for m in "${FBSD_MIRRORS[@]}"; do
-        listing="$(fetch_listing "$m")"; [ -n "$listing" ] || { warn "FreeBSD: $m not reachable — next mirror"; continue; }
-        ver="$(grep -oE '>[0-9]+\.[0-9]+/' <<<"$listing" | tr -d '>/' | sort -V -u | tail -n1 || true)"
-        [ -n "$ver" ] || { warn "FreeBSD: no releases listed on $m — next mirror"; continue; }
-        f="FreeBSD-$ver-RELEASE-amd64-disc1.iso"
-        sum="$(get "$m/$ver/CHECKSUM.SHA256-FreeBSD-$ver-RELEASE-amd64" | grep -F "($f)" | awk '{print $NF}' || true)"
-        [ -n "$sum" ] || { warn "FreeBSD: no checksum on $m — next mirror"; continue; }
-        if fetch_iso "FreeBSD $ver" "$m/$ver/$f" "$f" 256 "$sum"; then ISO_FBSD="$f"; break; fi
+        listing="$(fetch_listing "$m")"
+        vers="$( { grep -oE 'href="[0-9]+\.[0-9]+/' <<<"$listing" | grep -oE '[0-9]+\.[0-9]+'
+                   grep -oE '>[0-9]+\.[0-9]+/' <<<"$listing" | grep -oE '[0-9]+\.[0-9]+'
+                   printf '%s\n' 15.1 15.0 14.4 14.3; } | sort -t. -k1,1nr -k2,2nr -u | head -n 6 || true)"
+        for v in $vers; do
+            f="FreeBSD-$v-RELEASE-amd64-disc1.iso"
+            sum="$(get "$m/$v/CHECKSUM.SHA256-FreeBSD-$v-RELEASE-amd64" | grep -F "($f)" | awk '{print $NF}' || true)"
+            [ -n "$sum" ] || continue
+            if fetch_iso "FreeBSD $v" "$m/$v/$f" "$f" 256 "$sum"; then ISO_FBSD="$f"; break 2; fi
+        done
+        warn "FreeBSD: nothing usable on $m — next mirror"
     done
-    [ -n "$ISO_FBSD" ] || { warn "FreeBSD: every mirror failed"; failed=1; }
+    [ -n "$ISO_FBSD" ] || { warn "FreeBSD: every mirror failed (is download.freebsd.org reachable from this host?)"; failed=1; }
 
     # hand the folder to the real user if it's in their home
     if [ "$(id -u)" -eq 0 ] && [ -n "${TARGET_USER:-}" ] && [ "$TARGET_USER" != root ] \
@@ -1106,7 +1112,11 @@ install_grub_bios() {
         return 0
     fi
     echo "guest grub-install failed — trying the host's grub"
-    [ -d /usr/lib/grub/i386-pc ] || { echo "host has no BIOS grub modules either"; return 1; }
+    if [ ! -d /usr/lib/grub/i386-pc ]; then
+        echo "installing grub-pc-bin on the host (BIOS grub modules only — doesn't touch esmo's bootloader)"
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq grub-pc-bin >/dev/null 2>&1 || true
+    fi
+    [ -d /usr/lib/grub/i386-pc ] || { echo "no BIOS grub modules available"; return 1; }
     grub-install --target=i386-pc --boot-directory="$MNT/boot" \
         --modules="part_msdos ext2 biosdisk" "$LOOP"
 }
@@ -1271,8 +1281,14 @@ build_slackware_image() {
     local base=()
     while IFS= read -r f; do base+=("$f"); done < <(ls "$tree"/a/*.t?z 2>/dev/null | sort)
     echo ">>> stage 1/2: bootstrapping ${#base[@]} core packages from the host"
-    ROOT="$MNT" "$tools/sbin/installpkg" --root "$MNT" --terse "${base[@]}" >/dev/null 2>&1 || true
-    [ -x "$MNT/sbin/installpkg" ] && [ -x "$MNT/bin/bash" ] || { echo "core bootstrap failed"; return 1; }
+    ROOT="$MNT" "$tools/sbin/installpkg" --root "$MNT" --terse "${base[@]}" > "$WORK_DIR/logs/slackware-stage1.log" 2>&1 || true
+    # some doinst.sh steps rename *.new files; finish the ones the host couldn't
+    [ -x "$MNT/bin/bash" ] || { [ -f "$MNT/bin/bash4.new" ] && mv "$MNT/bin/bash4.new" "$MNT/bin/bash"; } || true
+    [ -e "$MNT/bin/sh" ] || ln -s bash "$MNT/bin/sh"
+    [ -x "$MNT/sbin/installpkg" ] || { echo "core bootstrap failed: no /sbin/installpkg (see slackware-stage1.log)"; return 1; }
+    [ -x "$MNT/bin/bash" ]        || { echo "core bootstrap failed: no /bin/bash (see slackware-stage1.log)"; return 1; }
+    [ -x "$MNT/usr/bin/env" ] || [ -x "$MNT/bin/env" ] || { echo "core bootstrap failed: no env"; return 1; }
+    [ -x "$MNT/usr/bin/env" ] || ln -s ../../bin/env "$MNT/usr/bin/env"
 
     chroot_prepare
     mkdir -p "$MNT/mnt/slackdvd"
@@ -1284,6 +1300,7 @@ build_slackware_image() {
     echo ">>> stage 2/2: installing $n Slackware packages inside the new system (takes a while)"
     in_chroot /bin/bash -c '
         cd /mnt/slackdvd || exit 1
+        echo "    series a (redo with Slackware'"'"'s own tools)"
         /sbin/upgradepkg --reinstall --terse a/*.t?z >/dev/null 2>&1
         for s in ap d l n x xap xfce; do
             [ -d "$s" ] || continue
@@ -1292,9 +1309,10 @@ build_slackware_image() {
         done
         /sbin/ldconfig
         true'
-    umount "$MNT/mnt/slackdvd" 2>/dev/null || umount -l "$MNT/mnt/slackdvd"
+    umount "$MNT/mnt/slackdvd" 2>/dev/null || umount -l "$MNT/mnt/slackdvd" || true
     rmdir "$MNT/mnt/slackdvd" 2>/dev/null || true
-    umount "$SRCMNT"; SRCMNT=""
+    umount "$SRCMNT" 2>/dev/null || umount -l "$SRCMNT" || true
+    SRCMNT=""
     [ -x "$MNT/usr/bin/startxfce4" ] || echo "warning: XFCE didn't install — check the log"
 
     echo ">>> configuring system"
@@ -1428,13 +1446,19 @@ pve_auto_vm() {
         local img="$WORK_DIR/$name.raw"
         section "Building $name (log: $log)"
         set +e
-        ( set -euo pipefail; trap img_cleanup EXIT; "$builder" "$img" "$size" ) > >(tee "$log") 2>&1
+        ( set -Eeuo pipefail
+          trap 'echo "!!! FAILED at line $LINENO: $BASH_COMMAND"' ERR
+          trap img_cleanup EXIT
+          "$builder" "$img" "$size" ) > >(tee "$log") 2>&1
         rc=$?
         set -e
         sleep 1
         if [ "$rc" -ne 0 ]; then
-            warn "$name build failed (code $rc) — see $log"
-            VM_STATE[$name]="failed — see $log"
+            local why; why="$(grep '^!!! FAILED' "$log" | head -n1 | sed 's/^!!! //' || true)"
+            warn "$name build failed (code $rc): ${why:-see log}"
+            echo "  ── last lines of $log ──"
+            tail -n 15 "$log" | sed 's/^/  │ /'
+            VM_STATE[$name]="failed: ${why:-code $rc} (log: $log)"
             rm -f "${img:?}"; return 0
         fi
         info "Importing $name disk into $PVE_STORAGE"
