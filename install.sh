@@ -32,9 +32,10 @@ fi
 #   • PROXMOX: run it on the Proxmox host (web shell or SSH, as root) and it
 #     builds 3 fully installed VMs with NO keyboard input — login ethan / 1234
 #     (root / 1234) — each with the shastenm rice already on it:
-#       void-shastenm       built from Void's ROOTFS in a chroot, rice baked in
-#       slackware-shastenm  DVD packages installed straight to disk, rice baked in
-#       freebsd-shastenm    FreeBSD's installer run unattended, rice on 1st boot
+#       void-shastenm       built from Void's ROOTFS in a chroot
+#       slackware-shastenm  DVD packages installed straight to disk
+#       freebsd-shastenm    FreeBSD's own installer, run unattended
+#     Every VM: OS installs → reboots → dotfiles install by themselves → reboots.
 #
 # Usage:
 #   ./install.sh [options] [dotfiles-bsd-main] [spectrwm-bsd-main]
@@ -806,11 +807,30 @@ print_summary() {
 # =============================================================================
 # Directory listings are read at run time, so you always get the newest
 # release; every image is checked against the project's own checksums.
-VOID_LIVE="${VOID_LIVE:-https://repo-default.voidlinux.org/live/current}"
-SLACK_ISO="${SLACK_ISO:-https://mirrors.slackware.com/slackware/slackware-iso}"
-FBSD_ISO="${FBSD_ISO:-https://download.freebsd.org/releases/amd64/amd64/ISO-IMAGES}"
+# Several mirrors per OS, tried in order. A mirror that 404s/403s or is down
+# is skipped — a single bad mirror can never stop the script any more.
+# (VOID_LIVE / SLACK_ISO / FBSD_ISO in the environment are tried first.)
+# shellcheck disable=SC2206
+VOID_MIRRORS=(${VOID_LIVE:-}
+    https://repo-default.voidlinux.org/live/current
+    https://repo-fastly.voidlinux.org/live/current
+    https://mirrors.servercentral.com/voidlinux/live/current
+    https://repo-de.voidlinux.org/live/current)
+# shellcheck disable=SC2206
+SLACK_MIRRORS=(${SLACK_ISO:-}
+    https://slackware.uk/slackware/slackware-iso
+    https://ftp.osuosl.org/pub/slackware/slackware-iso
+    https://mirrors.kernel.org/slackware/slackware-iso
+    https://mirrors.slackware.com/slackware/slackware-iso)
+# shellcheck disable=SC2206
+FBSD_MIRRORS=(${FBSD_ISO:-}
+    https://download.freebsd.org/releases/amd64/amd64/ISO-IMAGES
+    https://download.freebsd.org/ftp/releases/amd64/amd64/ISO-IMAGES
+    https://ftp.osuosl.org/pub/FreeBSD/releases/amd64/amd64/ISO-IMAGES)
 
-fetch_listing() { curl -fsSL "$1/" ; }
+# get <url> — print the page, or nothing; never fails (so set -e can't trip)
+get() { curl -fsSL --retry 2 --connect-timeout 20 --max-time 120 "$1" 2>/dev/null || true; }
+fetch_listing() { get "$1/"; }
 
 sha_check() {
     # sha_check <algo 256|512|md5> <file> <expected>
@@ -830,7 +850,7 @@ fetch_iso() {
     fi
     info "$label: downloading $file"
     curl -fL --retry 3 -# -C - -o "$out" "$url" || { rm -f "$out"; curl -fL --retry 3 -# -o "$out" "$url"; } \
-        || { warn "$label download failed"; return 1; }
+        || { warn "$label: download failed on this mirror"; return 1; }
     if ! sha_check "$algo" "$out" "$sum"; then
         warn "$label: checksum mismatch — downloading again from scratch"
         rm -f "$out"
@@ -854,43 +874,58 @@ download_isos() {
     fi
     mkdir -p "$ISO_DIR"
     info "Saving to $ISO_DIR"
-    local failed=0 f sum ver
+    local failed=0 f sum ver m listing
 
     # Void — x86_64 glibc base live image (the glibc build he moved to from musl)
-    f="$(fetch_listing "$VOID_LIVE" | grep -oE 'void-live-x86_64-[0-9]{8}-base\.iso' | sort -u | tail -n1)"
-    sum="$(curl -fsSL "$VOID_LIVE/sha256sum.txt" | grep -F "($f)" | awk '{print $NF}')"
-    if [ -n "$f" ] && [ -n "$sum" ]; then if fetch_iso "Void" "$VOID_LIVE/$f" "$f" 256 "$sum"; then ISO_VOID="$f"; else failed=1; fi
-    else warn "Void: couldn't read $VOID_LIVE"; failed=1; fi
-
-    # Void ROOTFS tarball — what the Proxmox auto-install builds the VM from
-    if [ "$DISTRO" = proxmox ] && [ "$PVE_VMS" -eq 1 ]; then
-        f="$(fetch_listing "$VOID_LIVE" | grep -oE 'void-x86_64-ROOTFS-[0-9]{8}\.tar\.xz' | sort -u | tail -n1)"
-        sum="$(curl -fsSL "$VOID_LIVE/sha256sum.txt" | grep -F "($f)" | awk '{print $NF}')"
-        if [ -n "$f" ] && [ -n "$sum" ]; then
-            local keep="$ISO_DIR"; ISO_DIR="$WORK_DIR/dl"; mkdir -p "$ISO_DIR"
-            if fetch_iso "Void ROOTFS" "$VOID_LIVE/$f" "$f" 256 "$sum"; then VOID_ROOTFS="$ISO_DIR/$f"; else failed=1; fi
-            ISO_DIR="$keep"
-        else warn "Void ROOTFS: not found in $VOID_LIVE"; failed=1; fi
-    fi
+    # + the ROOTFS tarball the Proxmox auto-install builds the VM from
+    local want_rootfs=0; [ "${DISTRO:-}" = proxmox ] && [ "$PVE_VMS" -eq 1 ] && want_rootfs=1
+    for m in "${VOID_MIRRORS[@]}"; do
+        listing="$(fetch_listing "$m")"; [ -n "$listing" ] || { warn "Void: $m not reachable — next mirror"; continue; }
+        local sums; sums="$(get "$m/sha256sum.txt")"
+        [ -n "$sums" ] || { warn "Void: no sha256sum.txt on $m — next mirror"; continue; }
+        if [ -z "$ISO_VOID" ]; then
+            f="$(grep -oE 'void-live-x86_64-[0-9]{8}-base\.iso' <<<"$listing" | sort -u | tail -n1 || true)"
+            sum="$(grep -F "($f)" <<<"$sums" | awk '{print $NF}' || true)"
+            if [ -n "$f" ] && [ -n "$sum" ] && fetch_iso "Void" "$m/$f" "$f" 256 "$sum"; then ISO_VOID="$f"; fi
+        fi
+        if [ "$want_rootfs" -eq 1 ] && [ -z "$VOID_ROOTFS" ]; then
+            f="$(grep -oE 'void-x86_64-ROOTFS-[0-9]{8}\.tar\.xz' <<<"$listing" | sort -u | tail -n1 || true)"
+            sum="$(grep -F "($f)" <<<"$sums" | awk '{print $NF}' || true)"
+            if [ -n "$f" ] && [ -n "$sum" ]; then
+                local keep="$ISO_DIR"; ISO_DIR="$WORK_DIR/dl"; mkdir -p "$ISO_DIR"
+                if fetch_iso "Void ROOTFS" "$m/$f" "$f" 256 "$sum"; then VOID_ROOTFS="$ISO_DIR/$f"; fi
+                ISO_DIR="$keep"
+            fi
+        fi
+        if [ -n "$ISO_VOID" ] && { [ "$want_rootfs" -eq 0 ] || [ -n "$VOID_ROOTFS" ]; }; then break; fi
+    done
+    [ -n "$ISO_VOID" ] || { warn "Void ISO: every mirror failed"; failed=1; }
+    if [ "$want_rootfs" -eq 1 ] && [ -z "$VOID_ROOTFS" ]; then warn "Void ROOTFS: every mirror failed"; failed=1; fi
 
     # Slackware — newest slackware64-X.Y install DVD
-    ver="$(fetch_listing "$SLACK_ISO" | grep -oE 'slackware64-[0-9]+\.[0-9]+-iso' | sort -t- -k2 -V -u | tail -n1)"
-    ver="${ver#slackware64-}"; ver="${ver%-iso}"
-    if [ -n "$ver" ]; then
+    for m in "${SLACK_MIRRORS[@]}"; do
+        listing="$(fetch_listing "$m")"; [ -n "$listing" ] || { warn "Slackware: $m not reachable — next mirror"; continue; }
+        ver="$(grep -oE 'slackware64-[0-9]+\.[0-9]+-iso' <<<"$listing" | sort -t- -k2 -V -u | tail -n1 || true)"
+        ver="${ver#slackware64-}"; ver="${ver%-iso}"
+        [ -n "$ver" ] || { warn "Slackware: no ISO folders on $m — next mirror"; continue; }
         f="slackware64-$ver-install-dvd.iso"
-        sum="$(curl -fsSL "$SLACK_ISO/slackware64-$ver-iso/$f.md5" | awk '{print $1}')"
-        if [ -n "$sum" ]; then if fetch_iso "Slackware $ver" "$SLACK_ISO/slackware64-$ver-iso/$f" "$f" md5 "$sum"; then ISO_SLACK="$f"; else failed=1; fi
-        else warn "Slackware: no checksum file"; failed=1; fi
-    else warn "Slackware: couldn't read $SLACK_ISO"; failed=1; fi
+        sum="$(get "$m/slackware64-$ver-iso/$f.md5" | awk '{print $1}' || true)"
+        [ -n "$sum" ] || { warn "Slackware: no checksum on $m — next mirror"; continue; }
+        if fetch_iso "Slackware $ver" "$m/slackware64-$ver-iso/$f" "$f" md5 "$sum"; then ISO_SLACK="$f"; break; fi
+    done
+    [ -n "$ISO_SLACK" ] || { warn "Slackware: every mirror failed"; failed=1; }
 
     # FreeBSD — newest RELEASE, disc1 (full installer, no network needed)
-    ver="$(fetch_listing "$FBSD_ISO" | grep -oE '>[0-9]+\.[0-9]+/' | tr -d '>/' | sort -V -u | tail -n1)"
-    if [ -n "$ver" ]; then
+    for m in "${FBSD_MIRRORS[@]}"; do
+        listing="$(fetch_listing "$m")"; [ -n "$listing" ] || { warn "FreeBSD: $m not reachable — next mirror"; continue; }
+        ver="$(grep -oE '>[0-9]+\.[0-9]+/' <<<"$listing" | tr -d '>/' | sort -V -u | tail -n1 || true)"
+        [ -n "$ver" ] || { warn "FreeBSD: no releases listed on $m — next mirror"; continue; }
         f="FreeBSD-$ver-RELEASE-amd64-disc1.iso"
-        sum="$(curl -fsSL "$FBSD_ISO/$ver/CHECKSUM.SHA256-FreeBSD-$ver-RELEASE-amd64" | grep -F "($f)" | awk '{print $NF}')"
-        if [ -n "$sum" ]; then if fetch_iso "FreeBSD $ver" "$FBSD_ISO/$ver/$f" "$f" 256 "$sum"; then ISO_FBSD="$f"; else failed=1; fi
-        else warn "FreeBSD: no checksum for $f"; failed=1; fi
-    else warn "FreeBSD: couldn't read $FBSD_ISO"; failed=1; fi
+        sum="$(get "$m/$ver/CHECKSUM.SHA256-FreeBSD-$ver-RELEASE-amd64" | grep -F "($f)" | awk '{print $NF}' || true)"
+        [ -n "$sum" ] || { warn "FreeBSD: no checksum on $m — next mirror"; continue; }
+        if fetch_iso "FreeBSD $ver" "$m/$ver/$f" "$f" 256 "$sum"; then ISO_FBSD="$f"; break; fi
+    done
+    [ -n "$ISO_FBSD" ] || { warn "FreeBSD: every mirror failed"; failed=1; }
 
     # hand the folder to the real user if it's in their home
     if [ "$(id -u)" -eq 0 ] && [ -n "${TARGET_USER:-}" ] && [ "$TARGET_USER" != root ] \
@@ -898,7 +933,8 @@ download_isos() {
         chown -R "$TARGET_USER" "$ISO_DIR" 2>/dev/null || true
     fi
 
-    [ "$failed" -eq 0 ] && ok "All 3 ISOs ready in $ISO_DIR" || warn "Some ISOs failed — re-run with --isos-only to resume"
+    if [ "$failed" -eq 0 ]; then ok "All 3 ISOs ready in $ISO_DIR"
+    else warn "Some downloads failed on every mirror — re-run to resume (finished ones are kept)"; fi
     ls -lh "$ISO_DIR"/*.iso 2>/dev/null | awk '{print "    " $5 "  " $NF}' || true
 }
 
@@ -1085,17 +1121,64 @@ add_vm_user() {
     printf '%s:%s\nroot:%s\n' "$VM_USER" "$VM_PASS" "$VM_PASS" | in_chroot chpasswd
 }
 
-run_rice_in_chroot() {
-    local extra=("$@")
+# -----------------------------------------------------------------------------
+# First boot: the OS installs, reboots, THEN this installs the rice and reboots
+# into it. Same script on all three VMs.
+# -----------------------------------------------------------------------------
+firstboot_script() {
+    # firstboot_script [extra install.sh args]
+    local extra="$*"
+    sed -e "s|@USER@|$VM_USER|g" -e "s|@EXTRA@|$extra|g" <<'FBEOF'
+#!/bin/sh
+# shastenm first boot — installs the dotfiles once, then reboots into them.
+# Log: /var/log/shastenm-rice.log   (re-run by hand: /usr/local/sbin/shastenm-firstboot)
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root
+FLAG=/var/db/shastenm-firstboot
+LOG=/var/log/shastenm-rice.log
+RICE=/root/shastenm-rice
+[ -f "$FLAG" ] || exit 0
+say() { echo "[shastenm] $*" >> "$LOG"; echo "[shastenm] $*" > /dev/console 2>/dev/null || true; }
+
+say "first boot — waiting for the network..."
+i=0
+until ping -c 1 8.8.8.8 >/dev/null 2>&1 || [ "$i" -ge 60 ]; do i=$((i + 1)); sleep 5; done
+
+if [ ! -f "$RICE/run.sh" ]; then
+    # FreeBSD keeps the rice on the second CD — copy it onto the disk
+    mkdir -p /mnt/rice
+    for d in /dev/iso9660/SHASTENM /dev/disk/by-label/SHASTENM /dev/cd0 /dev/cd1 /dev/sr0 /dev/sr1; do
+        [ -e "$d" ] || continue
+        if mount -t cd9660 -o ro "$d" /mnt/rice 2>/dev/null || mount -o ro "$d" /mnt/rice 2>/dev/null; then
+            if [ -f /mnt/rice/run.sh ]; then cp -R /mnt/rice "$RICE"; umount /mnt/rice; break; fi
+            umount /mnt/rice
+        fi
+    done
+fi
+[ -f "$RICE/run.sh" ] || { say "rice files not found — is the shastenm-rice CD attached?"; exit 1; }
+
+say "installing the shastenm dotfiles for @USER@ — the VM reboots by itself when done"
+say "watch it:  tail -f $LOG"
+if sh "$RICE/run.sh" --user @USER@ -y @EXTRA@ >> "$LOG" 2>&1; then
+    rm -f "$FLAG"
+    say "dotfiles installed — rebooting into the riced system"
+    sleep 5
+    reboot
+else
+    say "dotfiles install hit an error — see $LOG (it retries on the next boot)"
+    exit 1
+fi
+FBEOF
+}
+
+implant_rice() {
+    # implant_rice [extra args] — copy the rice onto the new disk + arm first boot
     rm -rf "${MNT:?}/root/shastenm-rice"
     cp -RPp "$WORK_DIR/rice-cd" "$MNT/root/shastenm-rice"
-    echo ">>> running the shastenm rice inside the new system"
-    if in_chroot sh /root/shastenm-rice/run.sh --user "$VM_USER" -y "${extra[@]}" 2>&1 \
-            | tee "$MNT/var/log/shastenm-rice.log"; then
-        echo ">>> rice installed"
-    else
-        echo ">>> rice finished with errors — see /var/log/shastenm-rice.log inside the VM"
-    fi
+    mkdir -p "$MNT/usr/local/sbin" "$MNT/var/db"
+    firstboot_script "$@" > "$MNT/usr/local/sbin/shastenm-firstboot"
+    chmod 755 "$MNT/usr/local/sbin/shastenm-firstboot"
+    touch "$MNT/var/db/shastenm-firstboot"
+    echo ">>> dotfiles implanted — they install automatically on the first boot"
 }
 
 # -----------------------------------------------------------------------------
@@ -1144,7 +1227,18 @@ build_void_image() {
     [ -f "$MNT/boot/initramfs-$kver.img" ] || in_chroot dracut -f "/boot/initramfs-$kver.img" "$kver"
     write_grub_cfg "Void Linux" "/boot/vmlinuz-$kver" "/boot/initramfs-$kver.img" "root=UUID=$ROOT_UUID"
 
-    run_rice_in_chroot
+    implant_rice
+    # runit service: runs the first-boot rice, retries every 10 min until it works
+    mkdir -p "$MNT/etc/sv/shastenm-firstboot"
+    cat > "$MNT/etc/sv/shastenm-firstboot/run" <<'EOF'
+#!/bin/sh
+[ -f /var/db/shastenm-firstboot ] && /usr/local/sbin/shastenm-firstboot
+if [ -f /var/db/shastenm-firstboot ]; then sleep 600; exit 1; fi
+rm -f /etc/runit/runsvdir/default/shastenm-firstboot
+exec sleep 1000000
+EOF
+    chmod 755 "$MNT/etc/sv/shastenm-firstboot/run"
+    ln -sfn /etc/sv/shastenm-firstboot "$MNT/etc/runit/runsvdir/default/shastenm-firstboot"
     img_cleanup
 }
 
@@ -1204,7 +1298,14 @@ build_slackware_image() {
     fi
 
     local extra=(); [ "$WITH_SPECTRWM_SLACK" -eq 1 ] && extra+=(--with-spectrwm)
-    run_rice_in_chroot "${extra[@]}"
+    implant_rice "${extra[@]}"
+    # rc.local runs at the end of boot, after rc.inet1 has brought up DHCP
+    touch "$MNT/etc/rc.d/rc.local"
+    if ! grep -q shastenm-firstboot "$MNT/etc/rc.d/rc.local"; then
+        printf '\n# shastenm: install the dotfiles on first boot\n[ -x /usr/local/sbin/shastenm-firstboot ] && /usr/local/sbin/shastenm-firstboot &\n' \
+            >> "$MNT/etc/rc.d/rc.local"
+    fi
+    chmod 755 "$MNT/etc/rc.d/rc.local"
     img_cleanup
 }
 
@@ -1226,23 +1327,23 @@ echo '@PASS@' | pw usermod root -h 0
 pw useradd @USER@ -m -G wheel,operator,video -s /bin/sh -c "@USER@"
 echo '@PASS@' | pw usermod @USER@ -h 0
 touch /var/db/shastenm-firstboot
+mkdir -p /usr/local/sbin
+cat > /usr/local/sbin/shastenm-firstboot <<'SMFB'
+@FIRSTBOOT@
+SMFB
+chmod 755 /usr/local/sbin/shastenm-firstboot
 cat > /etc/rc.local <<'RCEOF'
 #!/bin/sh
-# shastenm rice — runs once on first boot, log: /var/log/shastenm-rice.log
-if [ -f /var/db/shastenm-firstboot ]; then
-    (
-        sleep 10
-        mkdir -p /mnt/rice
-        if mount -t cd9660 /dev/iso9660/SHASTENM /mnt/rice; then
-            sh /mnt/rice/run.sh --user @USER@ -y && rm -f /var/db/shastenm-firstboot
-            umount /mnt/rice
-        fi
-    ) > /var/log/shastenm-rice.log 2>&1 &
-fi
+# shastenm: install the dotfiles on first boot (log: /var/log/shastenm-rice.log)
+[ -x /usr/local/sbin/shastenm-firstboot ] && /usr/local/sbin/shastenm-firstboot &
 RCEOF
 chmod +x /etc/rc.local
 EOF
     sed -i "s/@USER@/$VM_USER/g; s/@PASS@/$VM_PASS/g" "$cfg"
+    # drop the shared first-boot script in place of @FIRSTBOOT@
+    local fb="$WORK_DIR/firstboot.sh"
+    firstboot_script > "$fb"
+    sed -i -e "/^@FIRSTBOOT@\$/{r $fb" -e 'd;}' "$cfg"
     rm -f "${out:?}"
     xorriso -indev "$ISO_DIR/$ISO_FBSD" -outdev "$out" \
         -map "$cfg" /etc/installerconfig -boot_image any replay >/dev/null 2>&1 \
@@ -1275,7 +1376,7 @@ pve_auto_vm() {
             --ide2 "$PVE_ISO_STORAGE:iso/$ISO_FBSD_AUTO,media=cdrom" \
             --ide0 "$PVE_ISO_STORAGE:iso/shastenm-rice.iso,media=cdrom" \
             --boot 'order=scsi0;ide2' >/dev/null
-        ok "Created VM $id $name — it installs itself, reboots, then installs the rice"
+        ok "Created VM $id $name — installs FreeBSD by itself, reboots, then installs the dotfiles"
         VM_STATE[$name]="selfinstall"
     else
         local need_k free_k
@@ -1304,7 +1405,7 @@ pve_auto_vm() {
             --net0 "virtio,bridge=$PVE_BRIDGE" --vga std \
             --boot 'order=scsi0' >/dev/null
         rm -f "${img:?}"
-        ok "Created VM $id $name — already installed with the rice"
+        ok "Created VM $id $name — OS installed; dotfiles install on its first boot"
         VM_STATE[$name]="ready"
     fi
     VM_IDS+=("$id:$name")
@@ -1401,19 +1502,17 @@ proxmox_main() {
         st="${VM_STATE[$n]:-not created}"
         case "$st" in
             ready)
-                case "$n" in
-                    void-*)  echo "  $n      — installed + riced. Log in on the console, then: startx" ;;
-                    slack*)  echo "  $n — installed + riced (CLI rice on XFCE). Log in, then: startxfce4" ;;
-                esac ;;
+                echo "  $n — OS installed. Booting now: dotfiles install by themselves, then it reboots" ;;
             selfinstall)
-                echo "  $n   — installs itself (~5-10 min), reboots, then installs the"
-                echo "                       rice in the background: tail -f /var/log/shastenm-rice.log"
-                echo "                       When it finishes: log in as $VM_USER, then startx" ;;
+                echo "  $n — installing FreeBSD by itself (~5-10 min), reboots, installs the"
+                echo "                     dotfiles, then reboots again" ;;
             exists) echo "  $n — already existed, left untouched (--rebuild to redo it)" ;;
             *)      echo -e "  $n — ${RED}$st${NC}" ;;
         esac
     done
-    echo "  Build logs: $WORK_DIR/logs/"
+    echo "  Watch any VM's dotfiles install:  tail -f /var/log/shastenm-rice.log"
+    echo "  When a VM has rebooted the second time: log in as $VM_USER and run startx"
+    echo "  (Slackware: startxfce4). Host build logs: $WORK_DIR/logs/"
     echo ""
 }
 
